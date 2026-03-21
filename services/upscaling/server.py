@@ -186,26 +186,26 @@ def upscale_video(payload_video_path: str, task_type: str):
             raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
         print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
 
-        # Step 1.5: Denoise before upscaling
-        print("Step 1.5: Denoising with hqdn3d...")
-        start_time = time.time()
-
-        denoise_command = [
-            "ffmpeg", "-i", str(output_file_with_extra_frames),
-            "-vf", "hqdn3d=3:3:6:6",
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-            str(output_file_denoised)
-        ]
-        denoise_process = subprocess.run(
-            denoise_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        elapsed_time = time.time() - start_time
-        if denoise_process.returncode != 0:
-            print(f"Denoising failed: {denoise_process.stderr.strip()}")
-            raise HTTPException(status_code=500, detail=f"Denoising failed: {denoise_process.stderr.strip()}")
-        if not output_file_denoised.exists():
-            raise HTTPException(status_code=500, detail="Denoised video file was not created.")
-        print(f"Step 1.5 completed in {elapsed_time:.2f} seconds. Denoised file: {output_file_denoised}")
+        # Step 1.5: Denoise before upscaling (DISABLED — smoothing hurts PieAPP scores)
+        # print("Step 1.5: Denoising with hqdn3d...")
+        # start_time = time.time()
+        # denoise_command = [
+        #     "ffmpeg", "-i", str(output_file_with_extra_frames),
+        #     "-vf", "hqdn3d=3:3:6:6",
+        #     "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        #     str(output_file_denoised)
+        # ]
+        # denoise_process = subprocess.run(
+        #     denoise_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        # )
+        # elapsed_time = time.time() - start_time
+        # if denoise_process.returncode != 0:
+        #     print(f"Denoising failed: {denoise_process.stderr.strip()}")
+        #     raise HTTPException(status_code=500, detail=f"Denoising failed: {denoise_process.stderr.strip()}")
+        # if not output_file_denoised.exists():
+        #     raise HTTPException(status_code=500, detail="Denoised video file was not created.")
+        # print(f"Step 1.5 completed in {elapsed_time:.2f} seconds. Denoised file: {output_file_denoised}")
+        output_file_denoised = output_file_with_extra_frames  # skip denoise, feed directly
 
         # Step 2: Upscale using native PyTorch RealESRGAN on cuda:0, pipe directly to ffmpeg
         print(f"Step 2: Upscaling with RealESRGAN x{scale_factor} on cuda:0 (piped)...")
