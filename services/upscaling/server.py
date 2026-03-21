@@ -6,10 +6,15 @@ import os
 from fastapi.responses import JSONResponse
 import time
 import asyncio
+import tempfile
+import urllib.request
+import cv2
 from vidaio_subnet_core import CONFIG
 import re
 from pydantic import BaseModel
 from typing import Optional
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from realesrgan import RealESRGANer
 from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
@@ -21,7 +26,55 @@ class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
     # output_file_upscaled: Optional[str] = None
-    
+
+
+# ---------------------------------------------------------------------------
+# Model cache — initialised once at startup, reused across requests
+# ---------------------------------------------------------------------------
+_MODEL_DIR = Path.home() / ".cache" / "realesrgan"
+_MODEL_URLS = {
+    2: ("RealESRGAN_x2plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"),
+    4: ("RealESRGAN_x4plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"),
+}
+_upscalers: dict = {}
+
+
+def _get_upscaler(scale: int) -> RealESRGANer:
+    if scale in _upscalers:
+        return _upscalers[scale]
+
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    model_name, model_url = _MODEL_URLS[scale]
+    model_path = _MODEL_DIR / model_name
+
+    if not model_path.exists():
+        logger.info(f"Downloading {model_name}...")
+        urllib.request.urlretrieve(model_url, model_path)
+        logger.info(f"Downloaded {model_name} to {model_path}")
+
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
+    upscaler = RealESRGANer(
+        scale=scale,
+        model_path=str(model_path),
+        model=model,
+        tile=512,
+        tile_pad=10,
+        pre_pad=0,
+        half=True,
+        device="cuda:0",
+    )
+    _upscalers[scale] = upscaler
+    logger.info(f"RealESRGANer x{scale} loaded on cuda:0")
+    return upscaler
+
+
+@app.on_event("startup")
+async def preload_models():
+    logger.info("Pre-loading RealESRGAN models...")
+    _get_upscaler(2)
+    _get_upscaler(4)
+    logger.info("All models loaded.")
+
 
 def get_frame_rate(input_file: Path) -> float:
     """
@@ -51,7 +104,7 @@ def get_frame_rate(input_file: Path) -> float:
 
 def upscale_video(payload_video_path: str, task_type: str):
     """
-    Upscales a video using the video2x tool and returns the full paths of the upscaled video and the converted mp4 file.
+    Upscales a video using native PyTorch RealESRGAN and returns the full path of the upscaled video.
 
     Args:
         payload_video_path (str): The path to the video to upscale.
@@ -62,11 +115,7 @@ def upscale_video(payload_video_path: str, task_type: str):
     """
     try:
         input_file = Path(payload_video_path)
-
-        scale_factor = "2"
-
-        if task_type == "SD24K":
-            scale_factor = "4"
+        scale_factor = 4 if task_type == "SD24K" else 2
 
         # Validate input file
         if not input_file.exists() or not input_file.is_file():
@@ -110,50 +159,81 @@ def upscale_video(payload_video_path: str, task_type: str):
             raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
         print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
 
-        # Step 2: Upscale video using video2x
-        print("Step 2: Upscaling video using video2x...")
+        # Step 2: Upscale using native PyTorch RealESRGAN
+        print(f"Step 2: Upscaling with RealESRGAN x{scale_factor} on cuda:0...")
         start_time = time.time()
-        video2x_command = [
-            "video2x",
-            "-i", str(output_file_with_extra_frames),
-            "-o", str(output_file_upscaled),
-            "-p", "realesrgan",               
-            "-s", scale_factor,               
-            "-c", "libx265",                  
-            "-e", "preset=slow",              
-            "-e", "crf=20",                   
-            "-e", "profile=main",             
-            "-e", "pix_fmt=yuv420p",          
-            "-e", "sar=1:1",                  
-            "-e", "color_primaries=bt709",    
-            "-e", "color_trc=bt709",
-            "-e", "colorspace=bt709",
-            "-e", "movflags=+faststart",
-        ]
-        video2x_process = subprocess.run(video2x_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            frames_in = Path(tmp_dir) / "frames_in"
+            frames_out = Path(tmp_dir) / "frames_out"
+            frames_in.mkdir()
+            frames_out.mkdir()
+
+            # Extract frames as PNG
+            extract_result = subprocess.run(
+                ["ffmpeg", "-i", str(output_file_with_extra_frames), str(frames_in / "%08d.png")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if extract_result.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"Frame extraction failed: {extract_result.stderr.strip()}")
+
+            frame_paths = sorted(frames_in.glob("*.png"))
+            print(f"Extracted {len(frame_paths)} frames, upscaling...")
+
+            upscaler = _get_upscaler(scale_factor)
+            for i, frame_path in enumerate(frame_paths):
+                img = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
+                output, _ = upscaler.enhance(img, outscale=scale_factor)
+                cv2.imwrite(str(frames_out / frame_path.name), output)
+                if (i + 1) % 50 == 0:
+                    print(f"  {i + 1}/{len(frame_paths)} frames done")
+
+            print(f"All {len(frame_paths)} frames upscaled, reassembling...")
+
+            # Reassemble with same encoder settings as original video2x pipeline
+            reassemble_result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-framerate", str(frame_rate),
+                    "-i", str(frames_out / "%08d.png"),
+                    "-c:v", "libx265",
+                    "-crf", "20",
+                    "-preset", "slow",
+                    "-profile:v", "main",
+                    "-pix_fmt", "yuv420p",
+                    "-sar", "1:1",
+                    "-color_primaries", "bt709",
+                    "-color_trc", "bt709",
+                    "-colorspace", "bt709",
+                    "-movflags", "+faststart",
+                    str(output_file_upscaled),
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if reassemble_result.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"Reassembly failed: {reassemble_result.stderr.strip()}")
+
         elapsed_time = time.time() - start_time
-        if video2x_process.returncode != 0:
-            print(f"Upscaling failed: {video2x_process.stderr.strip()}")
-            raise HTTPException(status_code=500, detail=f"Upscaling failed: {video2x_process.stderr.strip()}")
         if not output_file_upscaled.exists():
-            print("Upscaled MP4 video file was not created.")
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
         print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
 
-        # Cleanup intermediate files if needed
+        # Cleanup intermediate files
         if output_file_with_extra_frames.exists():
             output_file_with_extra_frames.unlink()
             print(f"Intermediate file {output_file_with_extra_frames} deleted.")
-            
+
         if input_file.exists():
             input_file.unlink()
             print(f"Original file {input_file} deleted.")
-        
+
         print(f"Returning from FastAPI: {output_file_upscaled}")
         return output_file_upscaled
+
     except Exception as e:
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
 
 @app.post("/upscale-video")
 async def video_upscaler(request: UpscaleRequest):
