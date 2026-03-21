@@ -198,7 +198,7 @@ def upscale_video(payload_video_path: str, task_type: str):
                     "-i", str(frames_out / "%08d.png"),
                     "-c:v", "libx265",
                     "-crf", "20",
-                    "-preset", "slow",
+                    "-preset", "medium",
                     "-profile:v", "main",
                     "-pix_fmt", "yuv420p",
                     "-sar", "1:1",
