@@ -9,10 +9,13 @@ import asyncio
 import tempfile
 import urllib.request
 import cv2
+import torch
+import numpy as np
 from vidaio_subnet_core import CONFIG
 import re
 from pydantic import BaseModel
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from realesrgan import RealESRGANer
 from services.miner_utilities.redis_utils import schedule_file_deletion
@@ -29,19 +32,21 @@ class UpscaleRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Model cache — initialised once at startup, reused across requests
+# Model cache — two instances per scale (one per GPU), initialised at startup
+# Keys: (scale, gpu_id)
 # ---------------------------------------------------------------------------
 _MODEL_DIR = Path.home() / ".cache" / "realesrgan"
 _MODEL_URLS = {
     2: ("RealESRGAN_x2plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"),
     4: ("RealESRGAN_x4plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"),
 }
-_upscalers: dict = {}
+_upscalers: dict = {}  # (scale, gpu_id) -> RealESRGANer
 
 
-def _get_upscaler(scale: int) -> RealESRGANer:
-    if scale in _upscalers:
-        return _upscalers[scale]
+def _get_upscaler(scale: int, gpu_id: int) -> RealESRGANer:
+    key = (scale, gpu_id)
+    if key in _upscalers:
+        return _upscalers[key]
 
     _MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model_name, model_url = _MODEL_URLS[scale]
@@ -57,44 +62,36 @@ def _get_upscaler(scale: int) -> RealESRGANer:
         scale=scale,
         model_path=str(model_path),
         model=model,
-        tile=512,
-        tile_pad=10,
+        tile=0,
+        tile_pad=0,
         pre_pad=0,
         half=True,
-        device="cuda:0",
+        device=f"cuda:{gpu_id}",
     )
-    _upscalers[scale] = upscaler
-    logger.info(f"RealESRGANer x{scale} loaded on cuda:0")
+    logger.info(f"Compiling RealESRGANer x{scale} model with torch.compile (max-autotune)...")
+    upscaler.model = torch.compile(upscaler.model, mode="max-autotune")
+    _upscalers[key] = upscaler
+    logger.info(f"RealESRGANer x{scale} loaded and compiled on cuda:{gpu_id}")
     return upscaler
 
 
 @app.on_event("startup")
 async def preload_models():
-    logger.info("Pre-loading RealESRGAN models...")
-    _get_upscaler(2)
-    _get_upscaler(4)
-    logger.info("All models loaded.")
+    logger.info("Pre-loading RealESRGAN models on cuda:0...")
+    for scale in (2, 4):
+        _get_upscaler(scale, 0)
+    logger.info("All models loaded on cuda:0.")
 
 
 def get_frame_rate(input_file: Path) -> float:
-    """
-    Extracts the frame rate of the input video using FFmpeg.
-
-    Args:
-        input_file (Path): The path to the video file.
-
-    Returns:
-        float: The frame rate of the video.
-    """
     frame_rate_command = [
         "ffmpeg",
         "-i", str(input_file),
         "-hide_banner"
     ]
     process = subprocess.run(frame_rate_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    output = process.stderr  # Frame rate is usually in stderr
+    output = process.stderr
 
-    # Extract frame rate using regex
     match = re.search(r"(\d+(?:\.\d+)?) fps", output)
     if match:
         return float(match.group(1))
@@ -102,34 +99,64 @@ def get_frame_rate(input_file: Path) -> float:
         raise HTTPException(status_code=500, detail="Unable to determine frame rate of the video.")
 
 
+def _upscale_frames_piped(frame_paths: list, scale_factor: int, gpu_id: int, ffmpeg_proc, batch_size: int = 4) -> None:
+    """Upscale frames in batches on the given GPU and pipe raw BGR bytes directly to ffmpeg stdin."""
+    upscaler = _get_upscaler(scale_factor, gpu_id)
+    device = upscaler.device
+    total = len(frame_paths)
+
+    torch.cuda.empty_cache()  # flush fragmented reserved pool before large batch allocation
+
+    for batch_start in range(0, total, batch_size):
+        batch_paths = frame_paths[batch_start:batch_start + batch_size]
+
+        # Read JPEG frames and convert: BGR uint8 HWC → RGB float16 CHW
+        tensors = []
+        for p in batch_paths:
+            img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+            t = torch.from_numpy(np.ascontiguousarray(img[:, :, ::-1]).astype(np.float32) / 255.0)
+            tensors.append(t.permute(2, 0, 1))  # HWC → CHW
+
+        batch = torch.stack(tensors).to(device).half()  # (N, 3, H, W) FP16
+
+        with torch.no_grad():
+            out_batch = upscaler.model(batch)  # (N, 3, H*scale, W*scale) FP16
+
+        # Post-process on GPU: FP16 RGB → uint8 BGR, then transfer to CPU
+        out_np = (
+            out_batch.float().clamp_(0, 1)
+            .flip(1)                        # RGB → BGR (channel dim)
+            .mul_(255.0).round_()
+            .to(torch.uint8)
+            .permute(0, 2, 3, 1)            # NCHW → NHWC
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+
+        for j in range(len(batch_paths)):
+            ffmpeg_proc.stdin.write(out_np[j].tobytes())
+
+        done = min(batch_start + batch_size, total)
+        if done % 50 < batch_size or done == total:
+            logger.info(f"  cuda:{gpu_id}: {done}/{total} frames done")
+
+
 def upscale_video(payload_video_path: str, task_type: str):
-    """
-    Upscales a video using native PyTorch RealESRGAN and returns the full path of the upscaled video.
-
-    Args:
-        payload_video_path (str): The path to the video to upscale.
-        task_type (str): The type of upscaling task to perform.
-
-    Returns:
-        str: The full path to the upscaled video.
-    """
     try:
         input_file = Path(payload_video_path)
         scale_factor = 4 if task_type == "SD24K" else 2
 
-        # Validate input file
         if not input_file.exists() or not input_file.is_file():
             raise HTTPException(status_code=400, detail="Input file does not exist or is not a valid file.")
 
-        # Get the frame rate of the video
         frame_rate = get_frame_rate(input_file)
         print(f"Frame rate detected: {frame_rate} fps")
 
-        # Calculate the duration to duplicate 2 frames
         stop_duration = 2 / frame_rate
 
-        # Generate output file paths
         output_file_with_extra_frames = input_file.with_name(f"{input_file.stem}_extra_frames.mp4")
+        output_file_denoised = input_file.with_name(f"{input_file.stem}_denoised.mp4")
         output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
 
         # Step 1: Duplicate the last frame two times
@@ -159,66 +186,89 @@ def upscale_video(payload_video_path: str, task_type: str):
             raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
         print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
 
-        # Step 2: Upscale using native PyTorch RealESRGAN
-        print(f"Step 2: Upscaling with RealESRGAN x{scale_factor} on cuda:0...")
+        # Step 1.5: Denoise before upscaling
+        print("Step 1.5: Denoising with hqdn3d...")
+        start_time = time.time()
+
+        denoise_command = [
+            "ffmpeg", "-i", str(output_file_with_extra_frames),
+            "-vf", "hqdn3d=3:3:6:6",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+            str(output_file_denoised)
+        ]
+        denoise_process = subprocess.run(
+            denoise_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        elapsed_time = time.time() - start_time
+        if denoise_process.returncode != 0:
+            print(f"Denoising failed: {denoise_process.stderr.strip()}")
+            raise HTTPException(status_code=500, detail=f"Denoising failed: {denoise_process.stderr.strip()}")
+        if not output_file_denoised.exists():
+            raise HTTPException(status_code=500, detail="Denoised video file was not created.")
+        print(f"Step 1.5 completed in {elapsed_time:.2f} seconds. Denoised file: {output_file_denoised}")
+
+        # Step 2: Upscale using native PyTorch RealESRGAN on cuda:0, pipe directly to ffmpeg
+        print(f"Step 2: Upscaling with RealESRGAN x{scale_factor} on cuda:0 (piped)...")
         start_time = time.time()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             frames_in = Path(tmp_dir) / "frames_in"
-            frames_out = Path(tmp_dir) / "frames_out"
             frames_in.mkdir()
-            frames_out.mkdir()
 
-            # Extract frames as PNG
             extract_result = subprocess.run(
-                ["ffmpeg", "-i", str(output_file_with_extra_frames), str(frames_in / "%08d.png")],
+                ["ffmpeg", "-i", str(output_file_denoised), "-q:v", "2", str(frames_in / "%08d.jpg")],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
             if extract_result.returncode != 0:
                 raise HTTPException(status_code=500, detail=f"Frame extraction failed: {extract_result.stderr.strip()}")
 
-            frame_paths = sorted(frames_in.glob("*.png"))
-            print(f"Extracted {len(frame_paths)} frames, upscaling...")
+            frame_paths = sorted(frames_in.glob("*.jpg"))
+            total = len(frame_paths)
+            print(f"Extracted {total} frames, upscaling on cuda:0 via pipe...")
 
-            upscaler = _get_upscaler(scale_factor)
-            for i, frame_path in enumerate(frame_paths):
-                img = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
-                output, _ = upscaler.enhance(img, outscale=scale_factor)
-                cv2.imwrite(str(frames_out / frame_path.name), output)
-                if (i + 1) % 50 == 0:
-                    print(f"  {i + 1}/{len(frame_paths)} frames done")
+            # Determine output dimensions from first frame
+            first_img = cv2.imread(str(frame_paths[0]), cv2.IMREAD_UNCHANGED)
+            out_h = first_img.shape[0] * scale_factor
+            out_w = first_img.shape[1] * scale_factor
 
-            print(f"All {len(frame_paths)} frames upscaled, reassembling...")
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-vcodec", "rawvideo",
+                "-s", f"{out_w}x{out_h}",
+                "-pix_fmt", "bgr24",
+                "-r", str(frame_rate),
+                "-i", "pipe:0",
+                "-c:v", "libx264",
+                "-crf", "20",
+                "-preset", "fast",
+                "-pix_fmt", "yuv420p",
+                "-sar", "1:1",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-colorspace", "bt709",
+                "-movflags", "+faststart",
+                str(output_file_upscaled),
+            ]
+            ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Reassemble with same encoder settings as original video2x pipeline
-            reassemble_result = subprocess.run(
-                [
-                    "ffmpeg",
-                    "-framerate", str(frame_rate),
-                    "-i", str(frames_out / "%08d.png"),
-                    "-c:v", "libx265",
-                    "-crf", "20",
-                    "-preset", "medium",
-                    "-profile:v", "main",
-                    "-pix_fmt", "yuv420p",
-                    "-sar", "1:1",
-                    "-color_primaries", "bt709",
-                    "-color_trc", "bt709",
-                    "-colorspace", "bt709",
-                    "-movflags", "+faststart",
-                    str(output_file_upscaled),
-                ],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            if reassemble_result.returncode != 0:
-                raise HTTPException(status_code=500, detail=f"Reassembly failed: {reassemble_result.stderr.strip()}")
+            _upscale_frames_piped(frame_paths, scale_factor, 0, ffmpeg_proc)
+
+            _, ffmpeg_stderr = ffmpeg_proc.communicate()
+            if ffmpeg_proc.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"Reassembly failed: {ffmpeg_stderr.decode().strip()}")
+
+            print(f"All {total} frames upscaled and encoded.")
 
         elapsed_time = time.time() - start_time
         if not output_file_upscaled.exists():
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
         print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
 
-        # Cleanup intermediate files
+        if output_file_denoised.exists():
+            output_file_denoised.unlink()
+            print(f"Intermediate file {output_file_denoised} deleted.")
+
         if output_file_with_extra_frames.exists():
             output_file_with_extra_frames.unlink()
             print(f"Intermediate file {output_file_with_extra_frames} deleted.")
@@ -252,30 +302,28 @@ async def video_upscaler(request: UpscaleRequest):
 
         if processed_video_path is not None:
             object_name: str = processed_video_name
-            
+
             await storage_client.upload_file(object_name, processed_video_path)
             logger.info("Video uploaded successfully.")
-            
-            # Delete the local file since we've already uploaded it to MinIO
+
             if os.path.exists(processed_video_path):
                 os.remove(processed_video_path)
                 logger.info(f"{processed_video_path} has been deleted.")
             else:
                 logger.info(f"{processed_video_path} does not exist.")
-                
+
             sharing_link: str | None = await storage_client.get_presigned_url(object_name)
             if not sharing_link:
                 logger.error("Upload failed")
                 return {"uploaded_video_url": None}
-            
-            # Schedule the file for deletion after 10 minutes (600 seconds)
+
             deletion_scheduled = schedule_file_deletion(object_name)
             if deletion_scheduled:
                 logger.info(f"Scheduled deletion of {object_name} after 10 minutes")
             else:
                 logger.warning(f"Failed to schedule deletion of {object_name}")
-            
-            logger.info(f"Public download link: {sharing_link}")  
+
+            logger.info(f"Public download link: {sharing_link}")
 
             return {"uploaded_video_url": sharing_link}
 
@@ -286,10 +334,10 @@ async def video_upscaler(request: UpscaleRequest):
 
 
 if __name__ == "__main__":
-    
+
     import uvicorn
-    
+
     host = CONFIG.video_upscaler.host
     port = CONFIG.video_upscaler.port
-    
+
     uvicorn.run(app, host=host, port=port)
