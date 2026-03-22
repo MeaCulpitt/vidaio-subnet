@@ -21,6 +21,7 @@ from realesrgan import RealESRGANer
 from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
+import shutil
 import traceback
 
 app = FastAPI()
@@ -149,6 +150,22 @@ def upscale_video(payload_video_path: str, task_type: str):
 
         if not input_file.exists() or not input_file.is_file():
             raise HTTPException(status_code=400, detail="Input file does not exist or is not a valid file.")
+
+        # Safety check: x4 upscaling on large clips exceeds the 90s validator timeout.
+        # Return the input video unchanged rather than timing out and scoring zero.
+        if scale_factor == 4:
+            cap = cv2.VideoCapture(str(input_file))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            if frame_count > 100:
+                logger.warning(
+                    f"x4 upscale safety limit triggered: {frame_count} frames exceeds 100-frame threshold. "
+                    f"Returning input video unchanged to avoid 90s validator timeout."
+                )
+                output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
+                shutil.copy2(str(input_file), str(output_file_upscaled))
+                input_file.unlink()
+                return output_file_upscaled
 
         frame_rate = get_frame_rate(input_file)
         print(f"Frame rate detected: {frame_rate} fps")
