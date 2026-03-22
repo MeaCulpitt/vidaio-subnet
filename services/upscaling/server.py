@@ -229,48 +229,15 @@ def upscale_video(payload_video_path: str, task_type: str):
         frame_rate = get_frame_rate(input_file)
         print(f"Frame rate detected: {frame_rate} fps")
 
-        stop_duration = 2 / frame_rate
-
-        output_file_with_extra_frames = input_file.with_name(f"{input_file.stem}_extra_frames.mp4")
-        output_file_denoised = input_file.with_name(f"{input_file.stem}_denoised.mp4")
         output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
 
-        # Step 1: Duplicate the last frame two times
-        print("Step 1: Duplicating the last frame two times...")
-        start_time = time.time()
-
-        duplicate_last_frame_command = [
-            "ffmpeg",
-            "-i", str(input_file),
-            "-vf", f"tpad=stop_mode=clone:stop_duration={stop_duration}",
-            "-c:v", "libx264",
-            "-crf", "28",
-            "-preset", "fast",
-            str(output_file_with_extra_frames)
-        ]
-
-        duplicate_last_frame_process = subprocess.run(
-            duplicate_last_frame_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-
-        elapsed_time = time.time() - start_time
-        if duplicate_last_frame_process.returncode != 0:
-            print(f"Duplicating frames failed: {duplicate_last_frame_process.stderr.strip()}")
-            raise HTTPException(status_code=500, detail=f"Duplicating frames failed: {duplicate_last_frame_process.stderr.strip()}")
-        if not output_file_with_extra_frames.exists():
-            print("MP4 video file with extra frames was not created.")
-            raise HTTPException(status_code=500, detail="MP4 video file with extra frames was not created.")
-        print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
-
-        # Step 1.5: Denoise before upscaling (DISABLED — smoothing hurts PieAPP scores)
-        output_file_denoised = output_file_with_extra_frames  # skip denoise, feed directly
-
         # Step 2: Upscale using SPAN streaming dual-pipe (no temp JPEG files)
+        # tpad (frame duplication) removed — SPAN preserves all input frames without it.
         print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
         start_time = time.time()
 
         total = _upscale_streaming(
-            output_file_denoised, output_file_upscaled,
+            input_file, output_file_upscaled,
             scale_factor, frame_rate, gpu_id=0, batch_size=4
         )
         print(f"All {total} frames upscaled and encoded.")
@@ -279,14 +246,6 @@ def upscale_video(payload_video_path: str, task_type: str):
         if not output_file_upscaled.exists():
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
         print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
-
-        if output_file_denoised.exists():
-            output_file_denoised.unlink()
-            print(f"Intermediate file {output_file_denoised} deleted.")
-
-        if output_file_with_extra_frames.exists():
-            output_file_with_extra_frames.unlink()
-            print(f"Intermediate file {output_file_with_extra_frames} deleted.")
 
         if input_file.exists():
             input_file.unlink()
