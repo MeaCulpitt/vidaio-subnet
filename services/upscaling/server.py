@@ -6,7 +6,6 @@ import os
 from fastapi.responses import JSONResponse
 import time
 import asyncio
-import tempfile
 import cv2
 import torch
 import numpy as np
@@ -19,7 +18,6 @@ from spandrel import ModelLoader
 from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
-import shutil
 import traceback
 
 app = FastAPI()
@@ -80,47 +78,112 @@ def get_frame_rate(input_file: Path) -> float:
         raise HTTPException(status_code=500, detail="Unable to determine frame rate of the video.")
 
 
-def _upscale_frames_piped(frame_paths: list, scale_factor: int, gpu_id: int, ffmpeg_proc, batch_size: int = 4) -> None:
-    """Upscale frames in batches using SPAN on the given GPU and pipe raw BGR bytes to ffmpeg stdin."""
+def _get_video_dimensions(video_path: Path) -> tuple:
+    """Return (width, height) of the video using ffprobe."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+         '-show_entries', 'stream=width,height', '-of', 'csv=p=0',
+         str(video_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    w, h = map(int, result.stdout.strip().split(','))
+    return w, h
+
+
+def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
+                       frame_rate: float, gpu_id: int = 0, batch_size: int = 4) -> int:
+    """Streaming dual-pipe upscale: ffmpeg decode → SPAN → ffmpeg encode, no temp JPEG files.
+
+    Decoder outputs rgb24 rawvideo; encoder ingests rgb24 rawvideo.
+    SPAN operates on RGB natively so no channel flips are needed.
+    A ThreadPoolExecutor prefetches the next batch from the decoder pipe
+    while the GPU processes the current batch, overlapping IO with compute.
+    """
     model = _get_upscaler(scale_factor, gpu_id)
     device = next(model.parameters()).device
-    total = len(frame_paths)
-
     torch.cuda.empty_cache()
 
-    for batch_start in range(0, total, batch_size):
-        batch_paths = frame_paths[batch_start:batch_start + batch_size]
+    w, h = _get_video_dimensions(input_path)
+    out_w, out_h = w * scale_factor, h * scale_factor
+    frame_size = w * h * 3  # bytes per rgb24 frame
 
-        # Read JPEG frames: BGR uint8 HWC → RGB float16 NCHW, normalised to [0, 1]
-        tensors = []
-        for p in batch_paths:
-            img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
-            t = torch.from_numpy(np.ascontiguousarray(img[:, :, ::-1]).astype(np.float32) / 255.0)
-            tensors.append(t.permute(2, 0, 1))  # HWC → CHW
+    decoder = subprocess.Popen(
+        ['ffmpeg', '-i', str(input_path),
+         '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    encoder = subprocess.Popen(
+        ['ffmpeg', '-y',
+         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+         '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
+         '-i', 'pipe:0',
+         '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
+         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+         '-sar', '1:1',
+         '-color_primaries', 'bt709', '-color_trc', 'bt709',
+         '-colorspace', 'bt709',
+         '-movflags', '+faststart',
+         str(output_path)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE
+    )
 
-        batch = torch.stack(tensors).to(device).half()  # (N, 3, H, W) FP16
+    def read_batch():
+        """Read up to batch_size frames from decoder stdout."""
+        frames = []
+        for _ in range(batch_size):
+            raw = decoder.stdout.read(frame_size)
+            if len(raw) < frame_size:
+                break
+            frames.append(np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).copy())
+        return frames
 
-        with torch.no_grad():
-            out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16
+    total_frames = 0
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(read_batch)
+        while True:
+            batch_frames = future.result()
+            if not batch_frames:
+                break
 
-        # Post-process on GPU: FP16 RGB → uint8 BGR, then transfer to CPU
-        out_np = (
-            out_batch.float().clamp_(0, 1)
-            .flip(1)                        # RGB → BGR (channel dim)
-            .mul_(255.0).round_()
-            .to(torch.uint8)
-            .permute(0, 2, 3, 1)            # NCHW → NHWC
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
+            # Pre-fetch next batch while GPU processes current batch
+            next_future = executor.submit(read_batch)
 
-        for j in range(len(batch_paths)):
-            ffmpeg_proc.stdin.write(out_np[j].tobytes())
+            # RGB HWC uint8 → RGB NCHW FP16, normalised to [0, 1]
+            tensors = [
+                torch.from_numpy(f.astype(np.float32) / 255.0).permute(2, 0, 1)
+                for f in batch_frames
+            ]
+            batch = torch.stack(tensors).to(device).half()
 
-        done = min(batch_start + batch_size, total)
-        if done % 50 < batch_size or done == total:
-            logger.info(f"  cuda:{gpu_id}: {done}/{total} frames done")
+            with torch.no_grad():
+                out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16 RGB
+
+            # FP16 RGB NCHW → uint8 RGB NHWC → raw bytes for encoder
+            out_np = (
+                out_batch.float().clamp_(0, 1)
+                .mul_(255.0).round_()
+                .to(torch.uint8)
+                .permute(0, 2, 3, 1)   # NCHW → NHWC
+                .contiguous().cpu().numpy()
+            )
+            for j in range(len(batch_frames)):
+                encoder.stdin.write(out_np[j].tobytes())
+
+            total_frames += len(batch_frames)
+            if total_frames % 50 < batch_size or len(batch_frames) < batch_size:
+                logger.info(f"  cuda:{gpu_id}: {total_frames} frames done")
+
+            future = next_future
+
+    encoder.stdin.close()      # signal EOF to encoder
+    enc_stderr = encoder.stderr.read()  # drain stderr before wait
+    encoder.wait()
+    decoder.wait()
+
+    if encoder.returncode != 0:
+        raise RuntimeError(f"Encoder failed: {enc_stderr.decode()[:500]}")
+
+    return total_frames
 
 
 def upscale_video(payload_video_path: str, task_type: str):
@@ -202,59 +265,15 @@ def upscale_video(payload_video_path: str, task_type: str):
         # Step 1.5: Denoise before upscaling (DISABLED — smoothing hurts PieAPP scores)
         output_file_denoised = output_file_with_extra_frames  # skip denoise, feed directly
 
-        # Step 2: Upscale using SPAN on cuda:0, pipe directly to ffmpeg
-        print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (piped)...")
+        # Step 2: Upscale using SPAN streaming dual-pipe (no temp JPEG files)
+        print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
         start_time = time.time()
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            frames_in = Path(tmp_dir) / "frames_in"
-            frames_in.mkdir()
-
-            extract_result = subprocess.run(
-                ["ffmpeg", "-i", str(output_file_denoised), "-q:v", "2", str(frames_in / "%08d.jpg")],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            if extract_result.returncode != 0:
-                raise HTTPException(status_code=500, detail=f"Frame extraction failed: {extract_result.stderr.strip()}")
-
-            frame_paths = sorted(frames_in.glob("*.jpg"))
-            total = len(frame_paths)
-            print(f"Extracted {total} frames, upscaling on cuda:0 via pipe...")
-
-            # Determine output dimensions from first frame
-            first_img = cv2.imread(str(frame_paths[0]), cv2.IMREAD_UNCHANGED)
-            out_h = first_img.shape[0] * scale_factor
-            out_w = first_img.shape[1] * scale_factor
-
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-f", "rawvideo",
-                "-vcodec", "rawvideo",
-                "-s", f"{out_w}x{out_h}",
-                "-pix_fmt", "bgr24",
-                "-r", str(frame_rate),
-                "-i", "pipe:0",
-                "-c:v", "hevc_nvenc",
-                "-cq", "20",
-                "-preset", "p4",
-                "-profile:v", "main",
-                "-pix_fmt", "yuv420p",
-                "-sar", "1:1",
-                "-color_primaries", "bt709",
-                "-color_trc", "bt709",
-                "-colorspace", "bt709",
-                "-movflags", "+faststart",
-                str(output_file_upscaled),
-            ]
-            ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            _upscale_frames_piped(frame_paths, scale_factor, 0, ffmpeg_proc)
-
-            _, ffmpeg_stderr = ffmpeg_proc.communicate()
-            if ffmpeg_proc.returncode != 0:
-                raise HTTPException(status_code=500, detail=f"Reassembly failed: {ffmpeg_stderr.decode().strip()}")
-
-            print(f"All {total} frames upscaled and encoded.")
+        total = _upscale_streaming(
+            output_file_denoised, output_file_upscaled,
+            scale_factor, frame_rate, gpu_id=0, batch_size=4
+        )
+        print(f"All {total} frames upscaled and encoded.")
 
         elapsed_time = time.time() - start_time
         if not output_file_upscaled.exists():
