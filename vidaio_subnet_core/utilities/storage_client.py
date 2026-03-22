@@ -1,3 +1,4 @@
+import re
 from minio import Minio
 import os
 import asyncio
@@ -636,11 +637,14 @@ def get_storage_client():
             bucket_name=CONFIG.storage.bucket_name,
         )
     elif bucket_type == "amazon_s3":
+        _region_match = re.search(r's3[.]([a-z0-9-]+)[.]amazonaws[.]com', CONFIG.storage.endpoint)
+        _region = _region_match.group(1) if _region_match else "eu-west-1"
         return AmazonS3Client(
             endpoint=CONFIG.storage.endpoint,
             access_key=CONFIG.storage.access_key,
             secret_key=CONFIG.storage.secret_key,
             bucket_name=CONFIG.storage.bucket_name,
+            region=_region,
         )
     elif bucket_type == "cloudflare":
         return CloudflareR2Client(
