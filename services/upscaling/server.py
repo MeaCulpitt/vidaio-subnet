@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse
 import time
 import asyncio
 import tempfile
-import urllib.request
 import cv2
 import torch
 import numpy as np
@@ -16,8 +15,7 @@ import re
 from pydantic import BaseModel
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
+from spandrel import ModelLoader
 from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
@@ -29,59 +27,41 @@ app = FastAPI()
 class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
-    # output_file_upscaled: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
-# Model cache — two instances per scale (one per GPU), initialised at startup
-# Keys: (scale, gpu_id)
+# Model cache — SPAN models loaded via spandrel, keyed by (scale, gpu_id)
 # ---------------------------------------------------------------------------
-_MODEL_DIR = Path.home() / ".cache" / "realesrgan"
-_MODEL_URLS = {
-    2: ("RealESRGAN_x2plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"),
-    4: ("RealESRGAN_x4plus.pth", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"),
+_SPAN_MODELS = {
+    2: Path.home() / ".cache" / "span" / "2xNomosUni_span.safetensors",
+    4: Path.home() / ".cache" / "span" / "4xNomosUni_span.safetensors",
 }
-_upscalers: dict = {}  # (scale, gpu_id) -> RealESRGANer
+_upscalers: dict = {}  # (scale, gpu_id) -> nn.Module (SPAN model)
 
 
-def _get_upscaler(scale: int, gpu_id: int) -> RealESRGANer:
+def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     key = (scale, gpu_id)
     if key in _upscalers:
         return _upscalers[key]
 
-    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model_name, model_url = _MODEL_URLS[scale]
-    model_path = _MODEL_DIR / model_name
-
+    model_path = _SPAN_MODELS[scale]
     if not model_path.exists():
-        logger.info(f"Downloading {model_name}...")
-        urllib.request.urlretrieve(model_url, model_path)
-        logger.info(f"Downloaded {model_name} to {model_path}")
+        raise RuntimeError(f"SPAN x{scale} model not found at {model_path}")
 
-    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
-    upscaler = RealESRGANer(
-        scale=scale,
-        model_path=str(model_path),
-        model=model,
-        tile=0,
-        tile_pad=0,
-        pre_pad=0,
-        half=True,
-        device=f"cuda:{gpu_id}",
-    )
-    logger.info(f"Compiling RealESRGANer x{scale} model with torch.compile (max-autotune)...")
-    upscaler.model = torch.compile(upscaler.model, mode="max-autotune")
-    _upscalers[key] = upscaler
-    logger.info(f"RealESRGANer x{scale} loaded and compiled on cuda:{gpu_id}")
-    return upscaler
+    logger.info(f"Loading SPAN x{scale} model from {model_path} on cuda:{gpu_id}...")
+    descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
+    model = descriptor.model.eval().half()
+    _upscalers[key] = model
+    logger.info(f"SPAN x{scale} loaded on cuda:{gpu_id}")
+    return model
 
 
 @app.on_event("startup")
 async def preload_models():
-    logger.info("Pre-loading RealESRGAN models on cuda:0...")
+    logger.info("Pre-loading SPAN models on cuda:0...")
     for scale in (2, 4):
         _get_upscaler(scale, 0)
-    logger.info("All models loaded on cuda:0.")
+    logger.info("All SPAN models loaded on cuda:0.")
 
 
 def get_frame_rate(input_file: Path) -> float:
@@ -101,17 +81,17 @@ def get_frame_rate(input_file: Path) -> float:
 
 
 def _upscale_frames_piped(frame_paths: list, scale_factor: int, gpu_id: int, ffmpeg_proc, batch_size: int = 4) -> None:
-    """Upscale frames in batches on the given GPU and pipe raw BGR bytes directly to ffmpeg stdin."""
-    upscaler = _get_upscaler(scale_factor, gpu_id)
-    device = upscaler.device
+    """Upscale frames in batches using SPAN on the given GPU and pipe raw BGR bytes to ffmpeg stdin."""
+    model = _get_upscaler(scale_factor, gpu_id)
+    device = next(model.parameters()).device
     total = len(frame_paths)
 
-    torch.cuda.empty_cache()  # flush fragmented reserved pool before large batch allocation
+    torch.cuda.empty_cache()
 
     for batch_start in range(0, total, batch_size):
         batch_paths = frame_paths[batch_start:batch_start + batch_size]
 
-        # Read JPEG frames and convert: BGR uint8 HWC → RGB float16 CHW
+        # Read JPEG frames: BGR uint8 HWC → RGB float16 NCHW, normalised to [0, 1]
         tensors = []
         for p in batch_paths:
             img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
@@ -121,7 +101,7 @@ def _upscale_frames_piped(frame_paths: list, scale_factor: int, gpu_id: int, ffm
         batch = torch.stack(tensors).to(device).half()  # (N, 3, H, W) FP16
 
         with torch.no_grad():
-            out_batch = upscaler.model(batch)  # (N, 3, H*scale, W*scale) FP16
+            out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16
 
         # Post-process on GPU: FP16 RGB → uint8 BGR, then transfer to CPU
         out_np = (
@@ -151,7 +131,7 @@ def upscale_video(payload_video_path: str, task_type: str):
         if not input_file.exists() or not input_file.is_file():
             raise HTTPException(status_code=400, detail="Input file does not exist or is not a valid file.")
 
-        # Safety check: x4 RealESRGAN on large clips exceeds the 90s validator timeout.
+        # Safety check: x4 SPAN on large clips may still exceed the 90s validator timeout.
         # Fall back to a fast lanczos resize to 3840x2160 encoded as hevc_nvenc so the
         # output passes the validator's resolution and codec checks and scores something
         # rather than timing out or returning wrong-resolution input.
@@ -162,7 +142,7 @@ def upscale_video(payload_video_path: str, task_type: str):
             if frame_count > 100:
                 logger.warning(
                     f"x4 upscale safety limit triggered: {frame_count} frames exceeds 100-frame threshold. "
-                    f"Using fast lanczos resize to 3840x2160 (hevc_nvenc) instead of RealESRGAN to stay within 90s."
+                    f"Using fast lanczos resize to 3840x2160 (hevc_nvenc) instead of SPAN to stay within 90s."
                 )
                 output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
                 lanczos_cmd = [
@@ -220,28 +200,10 @@ def upscale_video(payload_video_path: str, task_type: str):
         print(f"Step 1 completed in {elapsed_time:.2f} seconds. File with extra frames: {output_file_with_extra_frames}")
 
         # Step 1.5: Denoise before upscaling (DISABLED — smoothing hurts PieAPP scores)
-        # print("Step 1.5: Denoising with hqdn3d...")
-        # start_time = time.time()
-        # denoise_command = [
-        #     "ffmpeg", "-i", str(output_file_with_extra_frames),
-        #     "-vf", "hqdn3d=3:3:6:6",
-        #     "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-        #     str(output_file_denoised)
-        # ]
-        # denoise_process = subprocess.run(
-        #     denoise_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        # )
-        # elapsed_time = time.time() - start_time
-        # if denoise_process.returncode != 0:
-        #     print(f"Denoising failed: {denoise_process.stderr.strip()}")
-        #     raise HTTPException(status_code=500, detail=f"Denoising failed: {denoise_process.stderr.strip()}")
-        # if not output_file_denoised.exists():
-        #     raise HTTPException(status_code=500, detail="Denoised video file was not created.")
-        # print(f"Step 1.5 completed in {elapsed_time:.2f} seconds. Denoised file: {output_file_denoised}")
         output_file_denoised = output_file_with_extra_frames  # skip denoise, feed directly
 
-        # Step 2: Upscale using native PyTorch RealESRGAN on cuda:0, pipe directly to ffmpeg
-        print(f"Step 2: Upscaling with RealESRGAN x{scale_factor} on cuda:0 (piped)...")
+        # Step 2: Upscale using SPAN on cuda:0, pipe directly to ffmpeg
+        print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (piped)...")
         start_time = time.time()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
