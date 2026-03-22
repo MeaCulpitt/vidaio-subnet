@@ -11,7 +11,7 @@ from services.miner_utilities.miner_utils import video_upscaler, video_compresso
 
 from vidaio_subnet_core.utilities.version import check_version
 
-MAX_CONTENT_LEN = ContentLength.FIVE
+MAX_CONTENT_LEN = ContentLength.TEN
 warrant_task = TaskType.UPSCALING
 
 class Miner(BaseMiner):
