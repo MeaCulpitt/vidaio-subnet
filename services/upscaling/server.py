@@ -295,7 +295,7 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
 
     encoder = subprocess.Popen(
         ['ffmpeg', '-y',
-         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+         '-f', 'rawvideo', '-pix_fmt', 'nv12',
          '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
          '-i', 'pipe:0',
          '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
