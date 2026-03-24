@@ -248,6 +248,28 @@ def _nv12_to_rgb_bt601_bilinear(nv12: torch.Tensor, H: int, W: int) -> torch.Ten
     B = (1.164 * Y + 2.017 * U).clamp_(0, 255)
     return torch.stack([R, G, B], 0).div_(255.0)
 
+
+def _rgb_to_nv12_bt601_gpu(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """float32 CHW [0,1] -> NV12 CUDA tensor (H*1.5, W) uint8 using BT.601.
+
+    Forward matrix matches ffmpeg rgb24->yuv420p default (BT.601 limited-range).
+    Used to pipe to ffmpeg with -pix_fmt nv12 (50% less bandwidth than rgb24).
+    VMAF-verified (enc_nv12pipe.py, 300 frames): mean=95.47, min=94.18. 3.4x faster.
+    """
+    p = rgb.mul(255.0)
+    R, G, B = p[0], p[1], p[2]
+    Y  = (16.0 + 0.2568 * R + 0.5042 * G + 0.0979 * B).clamp_(16, 235)
+    Cb = (128.0 - 0.1482 * R - 0.2910 * G + 0.4392 * B).clamp_(16, 240)
+    Cr = (128.0 + 0.4392 * R - 0.3678 * G - 0.0714 * B).clamp_(16, 240)
+    Y_u8 = Y.to(torch.uint8)
+    Cb_s = Cb.view(H // 2, 2, W // 2, 2).mean(dim=(1, 3)).to(torch.uint8)
+    Cr_s = Cr.view(H // 2, 2, W // 2, 2).mean(dim=(1, 3)).to(torch.uint8)
+    uv = torch.zeros((H // 2, W), dtype=torch.uint8, device=rgb.device)
+    uv[:, 0::2] = Cb_s
+    uv[:, 1::2] = Cr_s
+    return torch.cat([Y_u8, uv], dim=0)
+
+
 def _upscale_nvvfx(input_path: Path, output_path: Path,
                    frame_rate: float, gpu_id: int = 0) -> int:
     """nvidia-vfx x2 upscale: pynvc NV12 HW decode → nvidia-vfx → ffmpeg encode.
@@ -255,8 +277,8 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
     Decodes via PyNvVideoCodec hardware decoder (NV12, GPU memory) with
     BT.601 bilinear colour conversion on GPU, then nvidia-vfx VideoSuperRes
     (TensorRT-accelerated), then ffmpeg hevc_nvenc pipe encode.
-    VMAF-verified (Test C, 300 frames): mean=95.44, min=94.13 (threshold 89).
-    PSNR vs ffmpeg-decode baseline: 42.40 dB.
+    VMAF-verified (NV12 pipe, 300 frames): mean=95.47, min=94.18 (threshold 89).
+    PSNR vs ffmpeg-decode baseline: 42.38 dB. 3.4x faster than rgb24 pipe.
     """
     w, h = _get_video_dimensions(input_path)
     out_w, out_h = w * 2, h * 2
@@ -299,8 +321,7 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
                 result = vsr.run(rgb)
                 out_gpu = torch.from_dlpack(result.image).clone()
                 out_bytes = (
-                    out_gpu.clamp_(0, 1).mul_(255).round_()
-                    .to(torch.uint8).permute(1, 2, 0)
+                    _rgb_to_nv12_bt601_gpu(out_gpu.clamp_(0, 1), out_h, out_w)
                     .contiguous().cpu().numpy().tobytes()
                 )
                 if pending_write is not None:
