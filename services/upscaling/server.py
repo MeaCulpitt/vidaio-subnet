@@ -19,6 +19,18 @@ from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
 import traceback
 
+# ---------------------------------------------------------------------------
+# Optional GPU-direct imports (nvidia-vfx + PyNvVideoCodec)
+# ---------------------------------------------------------------------------
+_GPU_DIRECT_AVAILABLE = False
+try:
+    import nvvfx
+    import PyNvVideoCodec as pynvc
+    _GPU_DIRECT_AVAILABLE = True
+    logger.info("GPU-direct pipeline available (nvidia-vfx + PyNvVideoCodec)")
+except ImportError as e:
+    logger.warning(f"GPU-direct pipeline not available ({e}), will use SPAN fallback")
+
 app = FastAPI()
 
 class UpscaleRequest(BaseModel):
@@ -30,10 +42,15 @@ class UpscaleRequest(BaseModel):
 # Model cache — SPAN models loaded via spandrel, keyed by (scale, gpu_id)
 # ---------------------------------------------------------------------------
 _SPAN_MODELS = {
-    2: Path.home() / ".cache" / "span" / "2xNomosUni_span.safetensors",
-    4: Path.home() / ".cache" / "span" / "4xNomosUni_span.safetensors",
+    2: Path.home() / ".cache" / "span" / "2xHFA2kSPAN.safetensors",
+    4: Path.home() / ".cache" / "span" / "4xNomos8k_span_otf_strong.pth",
 }
 _upscalers: dict = {}  # (scale, gpu_id) -> nn.Module (SPAN model)
+
+# ---------------------------------------------------------------------------
+# nvidia-vfx VideoSuperRes cache (for GPU-direct x2 path)
+# ---------------------------------------------------------------------------
+_vsr_cache: dict = {}  # (out_w, out_h, gpu_id) -> nvvfx.VideoSuperRes
 
 
 def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
@@ -53,12 +70,37 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     return model
 
 
+def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
+    """Get or create a cached nvidia-vfx VideoSuperRes instance."""
+    key = (out_w, out_h, gpu_id)
+    if key in _vsr_cache:
+        vsr = _vsr_cache[key]
+        if vsr.output_width == out_w and vsr.output_height == out_h:
+            return vsr
+    vsr = nvvfx.VideoSuperRes(
+        quality=nvvfx.VideoSuperRes.QualityLevel.HIGH, device=gpu_id
+    )
+    vsr.output_width = out_w
+    vsr.output_height = out_h
+    vsr.load()
+    _vsr_cache[key] = vsr
+    logger.info(f"nvidia-vfx VSR loaded: {out_w}x{out_h} on cuda:{gpu_id}")
+    return vsr
+
+
 @app.on_event("startup")
 async def preload_models():
-    logger.info("Pre-loading SPAN models on cuda:0...")
-    for scale in (2, 4):
-        _get_upscaler(scale, 0)
-    logger.info("All SPAN models loaded on cuda:0.")
+    # Always load SPAN x4 (GPU-direct only handles x2)
+    logger.info("Pre-loading SPAN x4 on cuda:0...")
+    _get_upscaler(4, 0)
+    if _GPU_DIRECT_AVAILABLE:
+        logger.info("Pre-loading nvidia-vfx VSR for x2 (1080p→4K) on cuda:0...")
+        _get_vsr(3840, 2160, 0)
+        logger.info("GPU-direct x2 pipeline ready.")
+    else:
+        logger.info("Pre-loading SPAN x2 on cuda:0 (fallback)...")
+        _get_upscaler(2, 0)
+    logger.info("All models loaded on cuda:0.")
 
 
 def get_frame_rate(input_file: Path) -> float:
@@ -185,6 +227,131 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
     return total_frames
 
 
+def _upscale_nvvfx(input_path: Path, output_path: Path,
+                   frame_rate: float, gpu_id: int = 0) -> int:
+    """nvidia-vfx x2 upscale: ffmpeg decode → nvidia-vfx → ffmpeg encode.
+
+    Uses nvidia-vfx VideoSuperRes (TensorRT-accelerated) instead of SPAN for
+    the x2 path. Same proven ffmpeg pipe IO as the SPAN path for color
+    correctness. A ThreadPoolExecutor overlaps the pipe reads/writes with GPU
+    inference for maximum throughput.
+    """
+    w, h = _get_video_dimensions(input_path)
+    out_w, out_h = w * 2, h * 2
+    frame_size = w * h * 3
+
+    vsr = _get_vsr(out_w, out_h, gpu_id)
+    torch.cuda.empty_cache()
+
+    decoder = subprocess.Popen(
+        ['ffmpeg', '-i', str(input_path),
+         '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    encoder = subprocess.Popen(
+        ['ffmpeg', '-y',
+         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+         '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
+         '-i', 'pipe:0',
+         '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
+         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+         '-sar', '1:1',
+         '-color_primaries', 'bt709', '-color_trc', 'bt709',
+         '-colorspace', 'bt709',
+         '-movflags', '+faststart',
+         str(output_path)],
+        stdin=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    def read_frame():
+        raw = decoder.stdout.read(frame_size)
+        if len(raw) < frame_size:
+            return None
+        return raw
+
+    total_frames = 0
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        # Pre-fetch first frame while we set up
+        future_read = pool.submit(read_frame)
+        pending_write = None
+
+        while True:
+            raw = future_read.result()
+            if raw is None:
+                break
+
+            # Pre-fetch next frame while we process current one
+            future_read = pool.submit(read_frame)
+
+            # CPU → GPU: upload raw bytes as uint8 tensor, convert to float32 on GPU
+            input_tensor = (torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+                            .reshape(h, w, 3).cuda(gpu_id)
+                            .to(torch.float32).div_(255.0)
+                            .permute(2, 0, 1).contiguous())
+
+            # INFERENCE (GPU, TensorRT-accelerated)
+            result = vsr.run(input_tensor)
+            out_gpu = torch.from_dlpack(result.image).clone()
+
+            # GPU → CPU: float32 CHW → uint8 HWC → bytes
+            out_bytes = (out_gpu.clamp_(0, 1).mul_(255).round_()
+                         .to(torch.uint8).permute(1, 2, 0)
+                         .contiguous().cpu().numpy().tobytes())
+
+            # Wait for previous write, then submit new one
+            if pending_write is not None:
+                pending_write.result()
+            pending_write = pool.submit(encoder.stdin.write, out_bytes)
+
+            total_frames += 1
+            if total_frames % 50 == 0:
+                logger.info(f"  nvvfx cuda:{gpu_id}: {total_frames} frames done")
+
+        if pending_write is not None:
+            pending_write.result()
+
+    encoder.stdin.close()
+    enc_stderr = encoder.stderr.read()
+    encoder.wait()
+    decoder.wait()
+
+    if encoder.returncode != 0:
+        raise RuntimeError(f"Encoder failed: {enc_stderr.decode()[:500]}")
+
+    return total_frames
+
+
+def _downscale_to_540p(input_path: Path, frame_rate: float) -> Path:
+    """Downscale video to 540p height (preserving aspect ratio) for x4 SPAN input.
+
+    SPAN x4 on 540p produces ~4K output. Without this, 1080p input would
+    produce 8K output that takes 172s+ and always times out.
+    """
+    w, h = _get_video_dimensions(input_path)
+    if h <= 540:
+        logger.info(f"Input already ≤540p ({w}x{h}), skipping downscale")
+        return input_path
+
+    logger.info(f"Pre-downscaling {w}x{h} → 540p for x4 SPAN (avoids 8K output)")
+    downscaled = input_path.with_name(f"{input_path.stem}_540p.mp4")
+    # scale to height=540, keep aspect ratio, ensure divisible by 2
+    cmd = [
+        'ffmpeg', '-y', '-i', str(input_path),
+        '-vf', 'scale=-2:540',
+        '-c:v', 'hevc_nvenc', '-cq', '18', '-preset', 'p4',
+        '-pix_fmt', 'yuv420p', '-r', str(frame_rate),
+        '-movflags', '+faststart',
+        str(downscaled)
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(f"Downscale failed: {result.stderr.decode()[:500]}")
+
+    new_w, new_h = _get_video_dimensions(downscaled)
+    logger.info(f"Downscaled to {new_w}x{new_h} → x4 output will be {new_w*4}x{new_h*4}")
+    return downscaled
+
+
 def upscale_video(payload_video_path: str, task_type: str):
     try:
         input_file = Path(payload_video_path)
@@ -196,25 +363,68 @@ def upscale_video(payload_video_path: str, task_type: str):
         frame_rate = get_frame_rate(input_file)
         print(f"Frame rate detected: {frame_rate} fps")
 
-        output_file_upscaled = input_file.with_name(f"{input_file.stem}_upscaled.mp4")
+        # x4 path: downscale to 540p first so SPAN x4 outputs ~4K, not 8K
+        if scale_factor == 4:
+            original_input = input_file
+            input_file = _downscale_to_540p(input_file, frame_rate)
+            # Clean up downscaled intermediate if it's a new file
+            if input_file != original_input:
+                _cleanup_540p = original_input  # will delete original after upscaling
+            else:
+                _cleanup_540p = None
+        else:
+            _cleanup_540p = None
 
-        # Step 2: Upscale using SPAN streaming dual-pipe (no temp JPEG files)
-        # tpad (frame duplication) removed — SPAN preserves all input frames without it.
-        print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
-        start_time = time.time()
-
-        total = _upscale_streaming(
-            input_file, output_file_upscaled,
-            scale_factor, frame_rate, gpu_id=0, batch_size=4
+        output_file_upscaled = Path(payload_video_path).with_name(
+            f"{Path(payload_video_path).stem}_upscaled.mp4"
         )
-        print(f"All {total} frames upscaled and encoded.")
 
-        elapsed_time = time.time() - start_time
+        # x2 path: use nvidia-vfx if available (2-3x faster), else SPAN fallback
+        if scale_factor == 2 and _GPU_DIRECT_AVAILABLE:
+            try:
+                print(f"Step 2: Upscaling with nvidia-vfx x2 on cuda:0...")
+                start_time = time.time()
+                total = _upscale_nvvfx(
+                    input_file, output_file_upscaled, frame_rate, gpu_id=0
+                )
+                print(f"All {total} frames upscaled and encoded (nvidia-vfx).")
+                elapsed_time = time.time() - start_time
+                print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
+            except Exception as e:
+                logger.warning(f"nvidia-vfx failed ({e}), falling back to SPAN x2...")
+                print(f"Step 2: Falling back to SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
+                start_time = time.time()
+                total = _upscale_streaming(
+                    input_file, output_file_upscaled,
+                    scale_factor, frame_rate, gpu_id=0, batch_size=4
+                )
+                print(f"All {total} frames upscaled and encoded (SPAN fallback).")
+                elapsed_time = time.time() - start_time
+                print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
+        else:
+            # x4 path: always uses SPAN (nvidia-vfx doesn't support x4 natively)
+            print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
+            start_time = time.time()
+            total = _upscale_streaming(
+                input_file, output_file_upscaled,
+                scale_factor, frame_rate, gpu_id=0, batch_size=4
+            )
+            print(f"All {total} frames upscaled and encoded.")
+            elapsed_time = time.time() - start_time
+            print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
+
         if not output_file_upscaled.exists():
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
-        print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
 
-        if input_file.exists():
+        # Clean up the 540p intermediate (if created) and the original input
+        if _cleanup_540p is not None:
+            if _cleanup_540p.exists():
+                _cleanup_540p.unlink()
+                print(f"Original file {_cleanup_540p} deleted.")
+            if input_file.exists():
+                input_file.unlink()
+                print(f"540p intermediate {input_file} deleted.")
+        elif input_file.exists():
             input_file.unlink()
             print(f"Original file {input_file} deleted.")
 
