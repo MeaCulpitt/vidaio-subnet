@@ -226,8 +226,18 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
             ]
             batch = torch.stack(tensors).to(device).half()
 
-            with torch.no_grad():
-                out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16 RGB
+            batch = batch.contiguous()
+            try:
+                with torch.no_grad():
+                    out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16 RGB
+            except (AssertionError, RuntimeError) as e:
+                if "stride" in str(e) or "meta" in str(e):
+                    logger.warning(f"torch.compile stride error, falling back to eager: {e}")
+                    eager_model = getattr(model, "_orig_mod", model)
+                    with torch.no_grad():
+                        out_batch = eager_model(batch)
+                else:
+                    raise
 
             if use_nv12:
                 # RGB→NV12 on GPU, async pipe write (halves 4K pipe bandwidth)
@@ -391,9 +401,9 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
 
 
 def _downscale_to_540p(input_path: Path, frame_rate: float) -> Path:
-    """Downscale video to 540p height (preserving aspect ratio) for x4 SPAN input.
+    """Downscale video to 540p height (preserving aspect ratio) for x4 EfRLFN input.
 
-    SPAN x4 on 540p produces ~4K output. Without this, 1080p input would
+    EfRLFN x4 on 540p produces ~4K output. Without this, 1080p input would
     produce 8K output that takes 172s+ and always times out.
     """
     w, h = _get_video_dimensions(input_path)
@@ -401,7 +411,7 @@ def _downscale_to_540p(input_path: Path, frame_rate: float) -> Path:
         logger.info(f"Input already ≤540p ({w}x{h}), skipping downscale")
         return input_path
 
-    logger.info(f"Pre-downscaling {w}x{h} → 540p for x4 SPAN (avoids 8K output)")
+    logger.info(f"Pre-downscaling {w}x{h} → 540p for x4 EfRLFN (avoids 8K output)")
     downscaled = input_path.with_name(f"{input_path.stem}_540p.mp4")
     # scale to height=540, keep aspect ratio, ensure divisible by 2
     cmd = [
@@ -432,7 +442,7 @@ def upscale_video(payload_video_path: str, task_type: str):
         frame_rate = get_frame_rate(input_file)
         print(f"Frame rate detected: {frame_rate} fps")
 
-        # x4 path: downscale to 540p first so SPAN x4 outputs ~4K, not 8K
+        # x4 path: downscale to 540p first so EfRLFN x4 outputs ~4K, not 8K
         if scale_factor == 4:
             original_input = input_file
             input_file = _downscale_to_540p(input_file, frame_rate)
@@ -511,6 +521,10 @@ async def video_upscaler(request: UpscaleRequest):
     try:
         payload_url = request.payload_url
         task_type = request.task_type
+
+        if not payload_url or not payload_url.startswith(("http://", "https://")):
+            logger.error(f"Invalid payload URL (missing protocol): {payload_url!r}")
+            return {"uploaded_video_url": None}
 
         logger.info("📻 Downloading video....")
         payload_video_path: str = await download_video(payload_url)
