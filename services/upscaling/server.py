@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from vidaio_subnet_core import CONFIG
 import re
+import json
 from pydantic import BaseModel
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
@@ -156,14 +157,74 @@ def _get_video_dimensions(video_path: Path) -> tuple:
     return w, h
 
 
+def _get_color_metadata(video_path: Path) -> dict:
+    """Extract color_space, color_primaries, color_transfer from input video.
+
+    Returns dict with keys: color_space, color_primaries, color_transfer.
+    Values are None if not present in the video metadata.
+    Used to mirror the input's color tags on the miner's output so the
+    validator's hard-fail colorspace comparison passes.
+    """
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+         '-show_entries', 'stream=color_space,color_primaries,color_transfer',
+         '-of', 'json',
+         str(video_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        info = json.loads(result.stdout)
+        stream = info.get("streams", [{}])[0]
+        meta = {
+            'color_space': stream.get('color_space'),
+            'color_primaries': stream.get('color_primaries'),
+            'color_transfer': stream.get('color_transfer'),
+        }
+        logger.info(f"Input color metadata: {meta}")
+        return meta
+    except (json.JSONDecodeError, IndexError):
+        logger.warning("Could not parse color metadata, returning empty")
+        return {'color_space': None, 'color_primaries': None, 'color_transfer': None}
+
+
+def _build_color_flags(color_meta: dict) -> list:
+    """Build ffmpeg encoder color metadata flags matching the input video.
+
+    Mirrors the input's tags so the validator's colorspace comparison
+    (ref vs dist) won't fail. Omits flags for unknown/absent values.
+    """
+    flags = []
+    cp = color_meta.get('color_primaries')
+    if cp and cp != 'unknown':
+        flags += ['-color_primaries', cp]
+    ct = color_meta.get('color_transfer')
+    if ct and ct != 'unknown':
+        flags += ['-color_trc', ct]
+    cs = color_meta.get('color_space')
+    if cs and cs != 'unknown':
+        flags += ['-colorspace', cs]
+    return flags
+
+
+def _is_bt709(color_meta: dict) -> bool:
+    """Determine if the input video uses BT.709 colorspace.
+
+    Returns True for BT.709 or when colorspace is absent/unknown
+    (HD content defaults to BT.709 in practice).
+    """
+    cs = (color_meta or {}).get('color_space')
+    return cs in ('bt709', None, 'unknown')
+
+
 def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
-                       frame_rate: float, gpu_id: int = 0, batch_size: int = 4) -> int:
-    """Streaming dual-pipe upscale: ffmpeg decode → model → ffmpeg encode.
+                       frame_rate: float, gpu_id: int = 0, batch_size: int = 4,
+                       color_meta: dict = None) -> int:
+    """Streaming dual-pipe upscale: ffmpeg decode -> model -> ffmpeg encode.
 
     Decoder outputs rgb24 rawvideo (input is small, ~1.5 MB/frame at 540p).
-    For x4: encoder ingests NV12 (12.4 MB/frame vs 24.9 MB RGB24 — 2x faster pipe).
+    For x4: encoder ingests NV12 (12.4 MB/frame vs 24.9 MB RGB24 -- 2x faster pipe).
     For x2: encoder ingests rgb24 (x2 uses nvidia-vfx path normally; this is fallback).
-    RGB→NV12 conversion done on GPU via BT.601 matrix before CPU transfer.
+    RGB->NV12 conversion done on GPU via BT.601/709 matrix (matching input) before CPU transfer.
     A ThreadPoolExecutor prefetches the next batch and overlaps pipe writes.
     """
     use_nv12 = (scale_factor == 4)
@@ -175,6 +236,13 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
     out_w, out_h = w * scale_factor, h * scale_factor
     frame_size = w * h * 3  # bytes per rgb24 input frame
 
+    # Select BT.601 or BT.709 NV12 conversion based on input colorspace
+    if use_nv12:
+        bt709 = _is_bt709(color_meta)
+        rgb_to_nv12 = _rgb_to_nv12_bt709_gpu if bt709 else _rgb_to_nv12_bt601_gpu
+        cs_label = "BT.709" if bt709 else "BT.601"
+        logger.info(f"NV12 encode will use {cs_label} matrix")
+
     decoder = subprocess.Popen(
         ['ffmpeg', '-i', str(input_path),
          '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
@@ -182,19 +250,20 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
     )
 
     enc_pix_fmt = 'nv12' if use_nv12 else 'rgb24'
+    enc_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-pix_fmt', enc_pix_fmt,
+        '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
+        '-i', 'pipe:0',
+        '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
+        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-sar', '1:1',
+        *_build_color_flags(color_meta or {}),
+        '-movflags', '+faststart',
+        str(output_path),
+    ]
     encoder = subprocess.Popen(
-        ['ffmpeg', '-y',
-         '-f', 'rawvideo', '-pix_fmt', enc_pix_fmt,
-         '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
-         '-i', 'pipe:0',
-         '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
-         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-         '-sar', '1:1',
-         '-color_primaries', 'bt709', '-color_trc', 'bt709',
-         '-colorspace', 'bt709',
-         '-movflags', '+faststart',
-         str(output_path)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE
+        enc_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
     def read_batch():
@@ -219,7 +288,7 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
             # Pre-fetch next batch while GPU processes current batch
             next_future = executor.submit(read_batch)
 
-            # RGB HWC uint8 → RGB NCHW FP16, normalised to [0, 1]
+            # RGB HWC uint8 -> RGB NCHW FP16, normalised to [0, 1]
             tensors = [
                 torch.from_numpy(f.astype(np.float32) / 255.0).permute(2, 0, 1)
                 for f in batch_frames
@@ -240,10 +309,10 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
                     raise
 
             if use_nv12:
-                # RGB→NV12 on GPU, async pipe write (halves 4K pipe bandwidth)
+                # RGB->NV12 on GPU, async pipe write (halves 4K pipe bandwidth)
                 for j in range(len(batch_frames)):
                     rgb_frame = out_batch[j].float().clamp_(0, 1)
-                    nv12_frame = _rgb_to_nv12_bt601_gpu(rgb_frame, out_h, out_w)
+                    nv12_frame = rgb_to_nv12(rgb_frame, out_h, out_w)
                     out_bytes = nv12_frame.contiguous().cpu().numpy().tobytes()
                     if pending_write is not None:
                         pending_write.result()
@@ -254,7 +323,7 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
                     out_batch.float().clamp_(0, 1)
                     .mul_(255.0).round_()
                     .to(torch.uint8)
-                    .permute(0, 2, 3, 1)   # NCHW → NHWC
+                    .permute(0, 2, 3, 1)   # NCHW -> NHWC
                     .contiguous().cpu().numpy()
                 )
                 for j in range(len(batch_frames)):
@@ -283,12 +352,11 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
     return total_frames
 
 
-
 def _nv12_to_rgb_bt601_bilinear(nv12: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """NV12 GPU tensor (H*1.5, W) uint8 → float32 RGB CHW [0,1].
+    """NV12 GPU tensor (H*1.5, W) uint8 -> float32 RGB CHW [0,1].
 
     Uses BT.601 limited-range inverse (correct for H.264 videos with unknown
-    colorspace — ffmpeg defaults to BT.601 for these) and bilinear chroma
+    colorspace -- ffmpeg defaults to BT.601 for these) and bilinear chroma
     upsampling (vs nearest-neighbour) for better quality at chroma transitions.
     VMAF-verified: this decode path gives mean=95.44, min=94.13.
     """
@@ -302,6 +370,25 @@ def _nv12_to_rgb_bt601_bilinear(nv12: torch.Tensor, H: int, W: int) -> torch.Ten
     R = (1.164 * Y + 1.596 * V).clamp_(0, 255)
     G = (1.164 * Y - 0.392 * U - 0.813 * V).clamp_(0, 255)
     B = (1.164 * Y + 2.017 * U).clamp_(0, 255)
+    return torch.stack([R, G, B], 0).div_(255.0)
+
+
+def _nv12_to_rgb_bt709_bilinear(nv12: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """NV12 GPU tensor (H*1.5, W) uint8 -> float32 RGB CHW [0,1].
+
+    Uses BT.709 limited-range inverse (correct for HD/4K content tagged as
+    BT.709). Same bilinear chroma upsampling as the BT.601 variant.
+    """
+    Y = nv12[:H].float() - 16.0
+    uv = nv12[H:].view(H // 2, W // 2, 2).float()
+    uv_up = torch.nn.functional.interpolate(
+        uv.permute(2, 0, 1).unsqueeze(0), scale_factor=2,
+        mode='bilinear', align_corners=False)
+    U = uv_up[0, 0] - 128.0
+    V = uv_up[0, 1] - 128.0
+    R = (1.164 * Y + 1.793 * V).clamp_(0, 255)
+    G = (1.164 * Y - 0.213 * U - 0.533 * V).clamp_(0, 255)
+    B = (1.164 * Y + 2.112 * U).clamp_(0, 255)
     return torch.stack([R, G, B], 0).div_(255.0)
 
 
@@ -326,18 +413,45 @@ def _rgb_to_nv12_bt601_gpu(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
     return torch.cat([Y_u8, uv], dim=0)
 
 
+def _rgb_to_nv12_bt709_gpu(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """float32 CHW [0,1] -> NV12 CUDA tensor (H*1.5, W) uint8 using BT.709.
+
+    Forward matrix for BT.709 limited-range. Used when the input video has
+    BT.709 color metadata to avoid a color shift vs the validator's reference.
+    """
+    p = rgb.mul(255.0)
+    R, G, B = p[0], p[1], p[2]
+    Y  = (16.0 + 0.1826 * R + 0.6142 * G + 0.0620 * B).clamp_(16, 235)
+    Cb = (128.0 - 0.1007 * R - 0.3386 * G + 0.4392 * B).clamp_(16, 240)
+    Cr = (128.0 + 0.4392 * R - 0.3989 * G - 0.0403 * B).clamp_(16, 240)
+    Y_u8 = Y.to(torch.uint8)
+    Cb_s = Cb.view(H // 2, 2, W // 2, 2).mean(dim=(1, 3)).to(torch.uint8)
+    Cr_s = Cr.view(H // 2, 2, W // 2, 2).mean(dim=(1, 3)).to(torch.uint8)
+    uv = torch.zeros((H // 2, W), dtype=torch.uint8, device=rgb.device)
+    uv[:, 0::2] = Cb_s
+    uv[:, 1::2] = Cr_s
+    return torch.cat([Y_u8, uv], dim=0)
+
+
 def _upscale_nvvfx(input_path: Path, output_path: Path,
-                   frame_rate: float, gpu_id: int = 0) -> int:
-    """nvidia-vfx x2 upscale: pynvc NV12 HW decode → nvidia-vfx → ffmpeg encode.
+                   frame_rate: float, gpu_id: int = 0,
+                   color_meta: dict = None) -> int:
+    """nvidia-vfx x2 upscale: pynvc NV12 HW decode -> nvidia-vfx -> ffmpeg encode.
 
     Decodes via PyNvVideoCodec hardware decoder (NV12, GPU memory) with
-    BT.601 bilinear colour conversion on GPU, then nvidia-vfx VideoSuperRes
-    (TensorRT-accelerated), then ffmpeg hevc_nvenc pipe encode.
-    VMAF-verified (NV12 pipe, 300 frames): mean=95.47, min=94.18 (threshold 89).
-    PSNR vs ffmpeg-decode baseline: 42.38 dB. 3.4x faster than rgb24 pipe.
+    BT.601/709 bilinear colour conversion on GPU (matching input colorspace),
+    then nvidia-vfx VideoSuperRes (TensorRT-accelerated), then ffmpeg
+    hevc_nvenc pipe encode with input-matching color metadata tags.
     """
     w, h = _get_video_dimensions(input_path)
     out_w, out_h = w * 2, h * 2
+
+    # Select BT.601 or BT.709 conversion based on input colorspace
+    bt709 = _is_bt709(color_meta)
+    nv12_to_rgb = _nv12_to_rgb_bt709_bilinear if bt709 else _nv12_to_rgb_bt601_bilinear
+    rgb_to_nv12 = _rgb_to_nv12_bt709_gpu if bt709 else _rgb_to_nv12_bt601_gpu
+    cs_label = "BT.709" if bt709 else "BT.601"
+    logger.info(f"nvvfx: NV12 decode/encode will use {cs_label} matrix")
 
     vsr = _get_vsr(out_w, out_h, gpu_id)
     torch.cuda.empty_cache()
@@ -349,19 +463,20 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
         decoderCacheSize=1
     )
 
+    enc_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-pix_fmt', 'nv12',
+        '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
+        '-i', 'pipe:0',
+        '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
+        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
+        '-sar', '1:1',
+        *_build_color_flags(color_meta or {}),
+        '-movflags', '+faststart',
+        str(output_path),
+    ]
     encoder = subprocess.Popen(
-        ['ffmpeg', '-y',
-         '-f', 'rawvideo', '-pix_fmt', 'nv12',
-         '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
-         '-i', 'pipe:0',
-         '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
-         '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-         '-sar', '1:1',
-         '-color_primaries', 'bt709', '-color_trc', 'bt709',
-         '-colorspace', 'bt709',
-         '-movflags', '+faststart',
-         str(output_path)],
-        stdin=subprocess.PIPE, stderr=subprocess.PIPE
+        enc_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
     total_frames = 0
@@ -373,11 +488,11 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
                 break
             for frame_dlpack in batch:
                 nv12 = torch.from_dlpack(frame_dlpack)
-                rgb = _nv12_to_rgb_bt601_bilinear(nv12, h, w)
+                rgb = nv12_to_rgb(nv12, h, w)
                 result = vsr.run(rgb)
                 out_gpu = torch.from_dlpack(result.image).clone()
                 out_bytes = (
-                    _rgb_to_nv12_bt601_gpu(out_gpu.clamp_(0, 1), out_h, out_w)
+                    rgb_to_nv12(out_gpu.clamp_(0, 1), out_h, out_w)
                     .contiguous().cpu().numpy().tobytes()
                 )
                 if pending_write is not None:
@@ -442,6 +557,10 @@ def upscale_video(payload_video_path: str, task_type: str):
         frame_rate = get_frame_rate(input_file)
         print(f"Frame rate detected: {frame_rate} fps")
 
+        # Probe input color metadata BEFORE any processing (downscale etc.)
+        # so we mirror the original source's color tags on our output.
+        color_meta = _get_color_metadata(input_file)
+
         # x4 path: downscale to 540p first so EfRLFN x4 outputs ~4K, not 8K
         if scale_factor == 4:
             original_input = input_file
@@ -464,7 +583,8 @@ def upscale_video(payload_video_path: str, task_type: str):
                 print(f"Step 2: Upscaling with nvidia-vfx x2 on cuda:0...")
                 start_time = time.time()
                 total = _upscale_nvvfx(
-                    input_file, output_file_upscaled, frame_rate, gpu_id=0
+                    input_file, output_file_upscaled, frame_rate, gpu_id=0,
+                    color_meta=color_meta
                 )
                 print(f"All {total} frames upscaled and encoded (nvidia-vfx).")
                 elapsed_time = time.time() - start_time
@@ -475,7 +595,8 @@ def upscale_video(payload_video_path: str, task_type: str):
                 start_time = time.time()
                 total = _upscale_streaming(
                     input_file, output_file_upscaled,
-                    scale_factor, frame_rate, gpu_id=0, batch_size=4
+                    scale_factor, frame_rate, gpu_id=0, batch_size=4,
+                    color_meta=color_meta
                 )
                 print(f"All {total} frames upscaled and encoded (SPAN fallback).")
                 elapsed_time = time.time() - start_time
@@ -487,7 +608,8 @@ def upscale_video(payload_video_path: str, task_type: str):
             start_time = time.time()
             total = _upscale_streaming(
                 input_file, output_file_upscaled,
-                scale_factor, frame_rate, gpu_id=0, batch_size=4
+                scale_factor, frame_rate, gpu_id=0, batch_size=4,
+                color_meta=color_meta
             )
             print(f"All {total} frames upscaled and encoded.")
             elapsed_time = time.time() - start_time
