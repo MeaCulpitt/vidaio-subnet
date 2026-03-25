@@ -158,29 +158,33 @@ def _get_video_dimensions(video_path: Path) -> tuple:
 
 def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
                        frame_rate: float, gpu_id: int = 0, batch_size: int = 4) -> int:
-    """Streaming dual-pipe upscale: ffmpeg decode → SPAN → ffmpeg encode, no temp JPEG files.
+    """Streaming dual-pipe upscale: ffmpeg decode → model → ffmpeg encode.
 
-    Decoder outputs rgb24 rawvideo; encoder ingests rgb24 rawvideo.
-    SPAN operates on RGB natively so no channel flips are needed.
-    A ThreadPoolExecutor prefetches the next batch from the decoder pipe
-    while the GPU processes the current batch, overlapping IO with compute.
+    Decoder outputs rgb24 rawvideo (input is small, ~1.5 MB/frame at 540p).
+    For x4: encoder ingests NV12 (12.4 MB/frame vs 24.9 MB RGB24 — 2x faster pipe).
+    For x2: encoder ingests rgb24 (x2 uses nvidia-vfx path normally; this is fallback).
+    RGB→NV12 conversion done on GPU via BT.601 matrix before CPU transfer.
+    A ThreadPoolExecutor prefetches the next batch and overlaps pipe writes.
     """
+    use_nv12 = (scale_factor == 4)
     model = _get_upscaler(scale_factor, gpu_id)
     device = next(model.parameters()).device
     torch.cuda.empty_cache()
 
     w, h = _get_video_dimensions(input_path)
     out_w, out_h = w * scale_factor, h * scale_factor
-    frame_size = w * h * 3  # bytes per rgb24 frame
+    frame_size = w * h * 3  # bytes per rgb24 input frame
 
     decoder = subprocess.Popen(
         ['ffmpeg', '-i', str(input_path),
          '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
+
+    enc_pix_fmt = 'nv12' if use_nv12 else 'rgb24'
     encoder = subprocess.Popen(
         ['ffmpeg', '-y',
-         '-f', 'rawvideo', '-pix_fmt', 'rgb24',
+         '-f', 'rawvideo', '-pix_fmt', enc_pix_fmt,
          '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
          '-i', 'pipe:0',
          '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
@@ -205,6 +209,7 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
 
     total_frames = 0
     with ThreadPoolExecutor(max_workers=2) as executor:
+        pending_write = None
         future = executor.submit(read_batch)
         while True:
             batch_frames = future.result()
@@ -224,22 +229,38 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
             with torch.no_grad():
                 out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16 RGB
 
-            # FP16 RGB NCHW → uint8 RGB NHWC → raw bytes for encoder
-            out_np = (
-                out_batch.float().clamp_(0, 1)
-                .mul_(255.0).round_()
-                .to(torch.uint8)
-                .permute(0, 2, 3, 1)   # NCHW → NHWC
-                .contiguous().cpu().numpy()
-            )
-            for j in range(len(batch_frames)):
-                encoder.stdin.write(out_np[j].tobytes())
+            if use_nv12:
+                # RGB→NV12 on GPU, async pipe write (halves 4K pipe bandwidth)
+                for j in range(len(batch_frames)):
+                    rgb_frame = out_batch[j].float().clamp_(0, 1)
+                    nv12_frame = _rgb_to_nv12_bt601_gpu(rgb_frame, out_h, out_w)
+                    out_bytes = nv12_frame.contiguous().cpu().numpy().tobytes()
+                    if pending_write is not None:
+                        pending_write.result()
+                    pending_write = executor.submit(encoder.stdin.write, out_bytes)
+            else:
+                # RGB24 path (x2 fallback)
+                out_np = (
+                    out_batch.float().clamp_(0, 1)
+                    .mul_(255.0).round_()
+                    .to(torch.uint8)
+                    .permute(0, 2, 3, 1)   # NCHW → NHWC
+                    .contiguous().cpu().numpy()
+                )
+                for j in range(len(batch_frames)):
+                    if pending_write is not None:
+                        pending_write.result()
+                    pending_write = executor.submit(
+                        encoder.stdin.write, out_np[j].tobytes())
 
             total_frames += len(batch_frames)
             if total_frames % 50 < batch_size or len(batch_frames) < batch_size:
                 logger.info(f"  cuda:{gpu_id}: {total_frames} frames done")
 
             future = next_future
+
+        if pending_write is not None:
+            pending_write.result()
 
     encoder.stdin.close()      # signal EOF to encoder
     enc_stderr = encoder.stderr.read()  # drain stderr before wait
