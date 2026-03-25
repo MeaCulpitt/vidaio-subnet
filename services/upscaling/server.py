@@ -39,13 +39,13 @@ class UpscaleRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Model cache — SPAN models loaded via spandrel, keyed by (scale, gpu_id)
+# Model cache — SPAN x2 loaded via spandrel, EfRLFN x4 loaded directly
 # ---------------------------------------------------------------------------
 _SPAN_MODELS = {
     2: Path.home() / ".cache" / "span" / "2xHFA2kSPAN.safetensors",
-    4: Path.home() / ".cache" / "span" / "4xNomos8k_span_otf_strong.pth",
 }
-_upscalers: dict = {}  # (scale, gpu_id) -> nn.Module (SPAN model)
+_EFRLFN_X4_PATH = Path.home() / ".cache" / "span" / "EfRLFN_x4.pt"
+_upscalers: dict = {}  # (scale, gpu_id) -> nn.Module
 
 # ---------------------------------------------------------------------------
 # nvidia-vfx VideoSuperRes cache (for GPU-direct x2 path)
@@ -58,16 +58,30 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     if key in _upscalers:
         return _upscalers[key]
 
-    model_path = _SPAN_MODELS[scale]
-    if not model_path.exists():
-        raise RuntimeError(f"SPAN x{scale} model not found at {model_path}")
-
-    logger.info(f"Loading SPAN x{scale} model from {model_path} on cuda:{gpu_id}...")
-    descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
-    model = descriptor.model.eval().half()
-    _upscalers[key] = model
-    logger.info(f"SPAN x{scale} loaded on cuda:{gpu_id}")
-    return model
+    if scale == 4:
+        # EfRLFN x4 — 0.5M params, VMAF 87.59 (vs SPAN 76.98)
+        from services.upscaling.efrlfn_arch.model import EfRLFN
+        if not _EFRLFN_X4_PATH.exists():
+            raise RuntimeError(f"EfRLFN x4 model not found at {_EFRLFN_X4_PATH}")
+        logger.info(f"Loading EfRLFN x4 from {_EFRLFN_X4_PATH} on cuda:{gpu_id}...")
+        model = EfRLFN(upscale=4)
+        state = torch.load(str(_EFRLFN_X4_PATH), map_location='cpu', weights_only=True)
+        model.load_state_dict(state, strict=True)
+        model = model.to(f"cuda:{gpu_id}").eval().half()
+        _upscalers[key] = model
+        logger.info(f"EfRLFN x4 loaded on cuda:{gpu_id} (0.50M params, fp16)")
+        return model
+    else:
+        # SPAN x2 via spandrel
+        model_path = _SPAN_MODELS[scale]
+        if not model_path.exists():
+            raise RuntimeError(f"SPAN x{scale} model not found at {model_path}")
+        logger.info(f"Loading SPAN x{scale} model from {model_path} on cuda:{gpu_id}...")
+        descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
+        model = descriptor.model.eval().half()
+        _upscalers[key] = model
+        logger.info(f"SPAN x{scale} loaded on cuda:{gpu_id}")
+        return model
 
 
 def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
@@ -90,8 +104,8 @@ def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
 
 @app.on_event("startup")
 async def preload_models():
-    # Always load SPAN x4 (GPU-direct only handles x2)
-    logger.info("Pre-loading SPAN x4 on cuda:0...")
+    # Always load EfRLFN x4 (GPU-direct only handles x2)
+    logger.info("Pre-loading EfRLFN x4 on cuda:0...")
     _get_upscaler(4, 0)
     if _GPU_DIRECT_AVAILABLE:
         logger.info("Pre-loading nvidia-vfx VSR for x2 (1080p→4K) on cuda:0...")
@@ -425,8 +439,9 @@ def upscale_video(payload_video_path: str, task_type: str):
                 elapsed_time = time.time() - start_time
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
         else:
-            # x4 path: always uses SPAN (nvidia-vfx doesn't support x4 natively)
-            print(f"Step 2: Upscaling with SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
+            # x4 path: uses EfRLFN (nvidia-vfx doesn't support x4 natively)
+            model_name = "EfRLFN" if scale_factor == 4 else "SPAN"
+            print(f"Step 2: Upscaling with {model_name} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
             start_time = time.time()
             total = _upscale_streaming(
                 input_file, output_file_upscaled,
