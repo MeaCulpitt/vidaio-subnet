@@ -68,8 +68,19 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
         state = torch.load(str(_EFRLFN_X4_PATH), map_location='cpu', weights_only=True)
         model.load_state_dict(state, strict=True)
         model = model.to(f"cuda:{gpu_id}").eval().half()
+        # torch.compile with dynamic shapes — avoids recompile for varying
+        # validator input resolutions (540p, 480p, etc.)
+        logger.info(f"Compiling EfRLFN x4 with torch.compile(dynamic=True)...")
+        model = torch.compile(model, dynamic=True)
+        # Warmup: trigger compilation for typical 540p input
+        dummy = torch.randn(1, 3, 540, 960, device=f"cuda:{gpu_id}", dtype=torch.float16)
+        for _ in range(3):
+            with torch.no_grad():
+                model(dummy)
+        del dummy
+        torch.cuda.empty_cache()
         _upscalers[key] = model
-        logger.info(f"EfRLFN x4 loaded on cuda:{gpu_id} (0.50M params, fp16)")
+        logger.info(f"EfRLFN x4 compiled and warmed up on cuda:{gpu_id} (0.50M params, fp16)")
         return model
     else:
         # SPAN x2 via spandrel
