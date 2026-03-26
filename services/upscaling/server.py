@@ -35,6 +35,14 @@ except ImportError as e:
 
 app = FastAPI()
 
+
+@app.get("/health")
+async def health():
+    """Health endpoint for pm2 / load-balancer monitoring."""
+    gpu_ok = torch.cuda.is_available()
+    return {"status": "ok" if gpu_ok else "degraded", "gpu": gpu_ok}
+
+
 class UpscaleRequest(BaseModel):
     payload_url: str
     task_type: str
@@ -335,13 +343,20 @@ def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
                 with torch.no_grad():
                     out_batch = model(batch)  # (N, 3, H*scale, W*scale) FP16 RGB
             except (AssertionError, RuntimeError) as e:
-                if "stride" in str(e) or "meta" in str(e):
+                err_msg = str(e).lower()
+                if "stride" in err_msg or "meta" in err_msg:
                     logger.warning(f"torch.compile stride error, falling back to eager: {e}")
                     eager_model = getattr(model, "_orig_mod", model)
                     with torch.no_grad():
                         out_batch = eager_model(batch)
-                else:
+                elif "input size" in err_msg or "kernel size" in err_msg or "out of memory" in err_msg:
+                    logger.error(f"Unrecoverable model error on {batch.shape}: {e}")
                     raise
+                else:
+                    logger.warning(f"Unexpected model error, falling back to eager: {e}")
+                    eager_model = getattr(model, "_orig_mod", model)
+                    with torch.no_grad():
+                        out_batch = eager_model(batch)
 
             if use_nv12:
                 # RGB->NV12 on GPU, async pipe write (halves 4K pipe bandwidth)
@@ -699,6 +714,14 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
         logger.info(f"Probe took {time.time()-t_probe:.2f}s")
         print(f"Frame rate detected: {frame_rate} fps")
 
+        # Reject degenerate inputs (0x0, or too small for conv kernels)
+        _MIN_DIM = 8  # PLKSR's 3x3 convs need at least 8px after feature extraction
+        if w < _MIN_DIM or h < _MIN_DIM:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input too small: {w}x{h} (minimum {_MIN_DIM}x{_MIN_DIM})"
+            )
+
         # Generate output path with UUID (works for both URL and file inputs)
         output_file_upscaled = Path("tmp") / f"{uuid.uuid4()}_upscaled.mp4"
         Path("tmp").mkdir(exist_ok=True)
@@ -772,6 +795,8 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
         print(f"Returning from FastAPI: {output_file_upscaled}")
         return output_file_upscaled
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
@@ -825,10 +850,14 @@ async def video_upscaler(request: UpscaleRequest):
 
             return {"uploaded_video_url": sharing_link}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to process upscaling request: {e}")
         traceback.print_exc()
         return {"uploaded_video_url": None}
+    finally:
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
