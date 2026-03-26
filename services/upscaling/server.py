@@ -112,8 +112,8 @@ def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
 
 @app.on_event("startup")
 async def preload_models():
-    # Load both x4 models: quality (RealESRNet) and fast (realesr-x4v3)
-    logger.info("Pre-loading x4 quality model (RealESRNet) on cuda:0...")
+    # Load both x4 models: quality (PLKSR) and fast (realesr-x4v3)
+    logger.info("Pre-loading x4 quality model (PLKSR) on cuda:0...")
     _get_upscaler(4, 0)
     logger.info("Pre-loading x4 fast model (realesr-x4v3) on cuda:0...")
     _get_upscaler("4fast", 0)
@@ -643,7 +643,7 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
         else:
             x4_key = ("4fast" if upscale_w * upscale_h > _X4_MAX_PIXELS else 4) if scale_factor == 4 else None
-            x4_label = "RealESRNet" if (x4_key == 4) else ("realesr-x4v3" if x4_key == "4fast" else "SPAN")
+            x4_label = "PLKSR" if (x4_key == 4) else ("realesr-x4v3" if x4_key == "4fast" else "SPAN")
             print(f"Step 2: Upscaling with {x4_label} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
             logger.info(f"x4 model selection: {upscale_w}x{upscale_h} = {upscale_w*upscale_h} pixels, model_key={x4_key}")
             start_time = time.time()
