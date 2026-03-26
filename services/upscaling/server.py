@@ -45,13 +45,13 @@ class UpscaleRequest(BaseModel):
 # ---------------------------------------------------------------------------
 _MODEL_PATHS = {
     2: Path.home() / ".cache" / "span" / "2xHFA2kSPAN.safetensors",
-    4: Path.home() / ".cache" / "span" / "RealESRNet_x4plus.pth",        # L1-only RRDB — best PieAPP
+    4: Path.home() / ".cache" / "span" / "PLKSR_X4_DF2K.pth",             # L1 PLKSR — BONUS tier PieAPP, fast
     "4fast": Path.home() / ".cache" / "span" / "realesr-general-x4v3.pth",  # GAN — fast fallback for large inputs
 }
 _upscalers: dict = {}  # (scale, gpu_id) -> nn.Module
-# RealESRNet x4: 107ms/f at 480x270, PieAPP=0.26 (NEUTRAL). Too slow for >360p inputs.
+# PLKSR x4: 66ms/f at 480x270, PieAPP=0.07 (BONUS). Handles up to ~1042x584 in budget.
 # realesr-x4v3: 5ms/f at 480x270, PieAPP>2.0 (PENALTY). Fast fallback.
-_X4_MAX_PIXELS = 230_400  # 640x360 — above this, fall back to fast model
+_X4_MAX_PIXELS = 650_000  # ~1042x624 — PLKSR handles this in ~59s. Above: GAN fallback.
 
 # ---------------------------------------------------------------------------
 # nvidia-vfx VideoSuperRes cache (for GPU-direct x2 path)
