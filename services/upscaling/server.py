@@ -45,9 +45,13 @@ class UpscaleRequest(BaseModel):
 # ---------------------------------------------------------------------------
 _MODEL_PATHS = {
     2: Path.home() / ".cache" / "span" / "2xHFA2kSPAN.safetensors",
-    4: Path.home() / ".cache" / "span" / "realesr-general-x4v3.pth",
+    4: Path.home() / ".cache" / "span" / "RealESRNet_x4plus.pth",        # L1-only RRDB — best PieAPP
+    "4fast": Path.home() / ".cache" / "span" / "realesr-general-x4v3.pth",  # GAN — fast fallback for large inputs
 }
 _upscalers: dict = {}  # (scale, gpu_id) -> nn.Module
+# RealESRNet x4: 107ms/f at 480x270, PieAPP=0.26 (NEUTRAL). Too slow for >360p inputs.
+# realesr-x4v3: 5ms/f at 480x270, PieAPP>2.0 (PENALTY). Fast fallback.
+_X4_MAX_PIXELS = 230_400  # 640x360 — above this, fall back to fast model
 
 # ---------------------------------------------------------------------------
 # nvidia-vfx VideoSuperRes cache (for GPU-direct x2 path)
@@ -70,17 +74,17 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     model = descriptor.model.eval().half()
     nparams = sum(p.numel() for p in model.parameters()) / 1e6
 
-    if scale == 4:
-        # torch.compile for x4 — dynamic shapes for varying validator resolutions
-        logger.info(f"Compiling {model_name} x4 with torch.compile(dynamic=True)...")
+    if scale == "4fast":
+        # Only compile the fast/small GAN model (torch.compile hurts RRDB performance)
+        logger.info(f"Compiling {model_name} x4fast with torch.compile(dynamic=True)...")
         model = torch.compile(model, dynamic=True)
-        dummy = torch.randn(1, 3, 540, 960, device=f"cuda:{gpu_id}", dtype=torch.float16)
+        dummy = torch.randn(1, 3, 270, 480, device=f"cuda:{gpu_id}", dtype=torch.float16)
         for _ in range(3):
             with torch.no_grad():
                 model(dummy)
         del dummy
         torch.cuda.empty_cache()
-        logger.info(f"{model_name} x4 compiled on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
+        logger.info(f"{model_name} x4fast compiled on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
     else:
         logger.info(f"{model_name} x{scale} loaded on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
 
@@ -108,9 +112,11 @@ def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
 
 @app.on_event("startup")
 async def preload_models():
-    # Always load x4 model
-    logger.info("Pre-loading x4 model on cuda:0...")
+    # Load both x4 models: quality (RealESRNet) and fast (realesr-x4v3)
+    logger.info("Pre-loading x4 quality model (RealESRNet) on cuda:0...")
     _get_upscaler(4, 0)
+    logger.info("Pre-loading x4 fast model (realesr-x4v3) on cuda:0...")
+    _get_upscaler("4fast", 0)
     if _GPU_DIRECT_AVAILABLE:
         logger.info("Pre-loading nvidia-vfx VSR for x2 (1080p→4K) on cuda:0...")
         _get_vsr(3840, 2160, 0)
@@ -243,7 +249,8 @@ def _is_bt709(color_meta: dict) -> bool:
 
 def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
                        frame_rate: float, gpu_id: int = 0, batch_size: int = 4,
-                       color_meta: dict = None, width: int = 0, height: int = 0) -> int:
+                       color_meta: dict = None, width: int = 0, height: int = 0,
+                       model_key=None) -> int:
     """Streaming dual-pipe upscale: ffmpeg decode -> model -> ffmpeg encode.
 
     input_source can be a local file path or an HTTP(S) URL — ffmpeg handles both.
@@ -254,7 +261,7 @@ def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
     A ThreadPoolExecutor prefetches the next batch and overlaps pipe writes.
     """
     use_nv12 = (scale_factor == 4)
-    model = _get_upscaler(scale_factor, gpu_id)
+    model = _get_upscaler(model_key or scale_factor, gpu_id)
     device = next(model.parameters()).device
     torch.cuda.empty_cache()
 
@@ -633,13 +640,16 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
                 elapsed_time = time.time() - start_time
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
         else:
-            model_name = "RealESR" if scale_factor == 4 else "SPAN"
-            print(f"Step 2: Upscaling with {model_name} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
+            x4_key = ("4fast" if upscale_w * upscale_h > _X4_MAX_PIXELS else 4) if scale_factor == 4 else None
+            x4_label = "RealESRNet" if (x4_key == 4) else ("realesr-x4v3" if x4_key == "4fast" else "SPAN")
+            print(f"Step 2: Upscaling with {x4_label} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
+            logger.info(f"x4 model selection: {upscale_w}x{upscale_h} = {upscale_w*upscale_h} pixels, model_key={x4_key}")
             start_time = time.time()
             total = _upscale_streaming(
                 upscale_source, output_file_upscaled,
                 scale_factor, frame_rate, gpu_id=0, batch_size=4,
-                color_meta=color_meta, width=upscale_w, height=upscale_h
+                color_meta=color_meta, width=upscale_w, height=upscale_h,
+                model_key=x4_key
             )
             print(f"All {total} frames upscaled and encoded.")
             elapsed_time = time.time() - start_time
