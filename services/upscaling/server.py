@@ -605,15 +605,8 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
         Path("tmp").mkdir(exist_ok=True)
         cleanup_files = []  # local intermediates to delete
 
-        # x4 path: downscale to 540p first (handles URLs — ffmpeg downloads+downscales)
-        if scale_factor == 4:
-            ds_source, ds_w, ds_h, ds_created = _downscale_to_540p(
-                input_source, frame_rate, w, h)
-            if ds_created:
-                cleanup_files.append(Path(ds_source))
-            upscale_source, upscale_w, upscale_h = ds_source, ds_w, ds_h
-        else:
-            upscale_source, upscale_w, upscale_h = input_source, w, h
+        # Pass input directly to upscaler (no downscale — validator expects output = input × scale_factor)
+        upscale_source, upscale_w, upscale_h = input_source, w, h
 
         # x2 path: use nvidia-vfx if available (2-3x faster), else SPAN fallback
         if scale_factor == 2 and _GPU_DIRECT_AVAILABLE:
