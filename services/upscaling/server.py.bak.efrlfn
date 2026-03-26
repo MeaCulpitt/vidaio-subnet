@@ -41,17 +41,13 @@ class UpscaleRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Model cache — all models loaded via spandrel
+# Model cache — SPAN x2 loaded via spandrel, EfRLFN x4 loaded directly
 # ---------------------------------------------------------------------------
-_MODEL_PATHS = {
+_SPAN_MODELS = {
     2: Path.home() / ".cache" / "span" / "2xHFA2kSPAN.safetensors",
-    4: Path.home() / ".cache" / "span" / "PLKSR_X4_DF2K.pth",             # L1 PLKSR — BONUS tier PieAPP, fast
-    "4fast": Path.home() / ".cache" / "span" / "realesr-general-x4v3.pth",  # GAN — fast fallback for large inputs
 }
+_EFRLFN_X4_PATH = Path.home() / ".cache" / "span" / "EfRLFN_x4.pt"
 _upscalers: dict = {}  # (scale, gpu_id) -> nn.Module
-# PLKSR x4: 66ms/f at 480x270, PieAPP=0.07 (BONUS). Handles up to ~1042x584 in budget.
-# realesr-x4v3: 5ms/f at 480x270, PieAPP>2.0 (PENALTY). Fast fallback.
-_X4_MAX_PIXELS = 650_000  # ~1042x624 — PLKSR handles this in ~59s. Above: GAN fallback.
 
 # ---------------------------------------------------------------------------
 # nvidia-vfx VideoSuperRes cache (for GPU-direct x2 path)
@@ -64,32 +60,41 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     if key in _upscalers:
         return _upscalers[key]
 
-    model_path = _MODEL_PATHS.get(scale)
-    if model_path is None or not model_path.exists():
-        raise RuntimeError(f"Model for x{scale} not found at {model_path}")
-
-    model_name = model_path.stem
-    logger.info(f"Loading {model_name} x{scale} from {model_path} on cuda:{gpu_id} (spandrel)...")
-    descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
-    model = descriptor.model.eval().half()
-    nparams = sum(p.numel() for p in model.parameters()) / 1e6
-
-    if scale == "4fast":
-        # Only compile the fast/small GAN model (torch.compile hurts RRDB performance)
-        logger.info(f"Compiling {model_name} x4fast with torch.compile(dynamic=True)...")
+    if scale == 4:
+        # EfRLFN x4 — 0.5M params, VMAF 87.59 (vs SPAN 76.98)
+        from services.upscaling.efrlfn_arch.model import EfRLFN
+        if not _EFRLFN_X4_PATH.exists():
+            raise RuntimeError(f"EfRLFN x4 model not found at {_EFRLFN_X4_PATH}")
+        logger.info(f"Loading EfRLFN x4 from {_EFRLFN_X4_PATH} on cuda:{gpu_id}...")
+        model = EfRLFN(upscale=4)
+        state = torch.load(str(_EFRLFN_X4_PATH), map_location='cpu', weights_only=True)
+        model.load_state_dict(state, strict=True)
+        model = model.to(f"cuda:{gpu_id}").eval().half()
+        # torch.compile with dynamic shapes — avoids recompile for varying
+        # validator input resolutions (540p, 480p, etc.)
+        logger.info(f"Compiling EfRLFN x4 with torch.compile(dynamic=True)...")
         model = torch.compile(model, dynamic=True)
-        dummy = torch.randn(1, 3, 270, 480, device=f"cuda:{gpu_id}", dtype=torch.float16)
+        # Warmup: trigger compilation for typical 540p input
+        dummy = torch.randn(1, 3, 540, 960, device=f"cuda:{gpu_id}", dtype=torch.float16)
         for _ in range(3):
             with torch.no_grad():
                 model(dummy)
         del dummy
         torch.cuda.empty_cache()
-        logger.info(f"{model_name} x4fast compiled on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
+        _upscalers[key] = model
+        logger.info(f"EfRLFN x4 compiled and warmed up on cuda:{gpu_id} (0.50M params, fp16)")
+        return model
     else:
-        logger.info(f"{model_name} x{scale} loaded on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
-
-    _upscalers[key] = model
-    return model
+        # SPAN x2 via spandrel
+        model_path = _SPAN_MODELS[scale]
+        if not model_path.exists():
+            raise RuntimeError(f"SPAN x{scale} model not found at {model_path}")
+        logger.info(f"Loading SPAN x{scale} model from {model_path} on cuda:{gpu_id}...")
+        descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
+        model = descriptor.model.eval().half()
+        _upscalers[key] = model
+        logger.info(f"SPAN x{scale} loaded on cuda:{gpu_id}")
+        return model
 
 
 def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
@@ -112,11 +117,9 @@ def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
 
 @app.on_event("startup")
 async def preload_models():
-    # Load both x4 models: quality (PLKSR) and fast (realesr-x4v3)
-    logger.info("Pre-loading x4 quality model (PLKSR) on cuda:0...")
+    # Always load EfRLFN x4 (GPU-direct only handles x2)
+    logger.info("Pre-loading EfRLFN x4 on cuda:0...")
     _get_upscaler(4, 0)
-    logger.info("Pre-loading x4 fast model (realesr-x4v3) on cuda:0...")
-    _get_upscaler("4fast", 0)
     if _GPU_DIRECT_AVAILABLE:
         logger.info("Pre-loading nvidia-vfx VSR for x2 (1080p→4K) on cuda:0...")
         _get_vsr(3840, 2160, 0)
@@ -238,19 +241,16 @@ def _build_color_flags(color_meta: dict) -> list:
 def _is_bt709(color_meta: dict) -> bool:
     """Determine if the input video uses BT.709 colorspace.
 
-    Returns True only for explicitly BT.709-tagged content.
-    Defaults to BT.601 for absent/unknown tags -- this matches ffmpeg's
-    default yuv<->rgb matrix for untagged content and avoids the colour
-    shift that caused PieAPP=10+ vs PieAPP=3 with correct BT.601.
+    Returns True for BT.709 or when colorspace is absent/unknown
+    (HD content defaults to BT.709 in practice).
     """
     cs = (color_meta or {}).get('color_space')
-    return cs == 'bt709'  # None / unknown / absent -> BT.601
+    return cs in ('bt709', None, 'unknown')
 
 
 def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
                        frame_rate: float, gpu_id: int = 0, batch_size: int = 4,
-                       color_meta: dict = None, width: int = 0, height: int = 0,
-                       model_key=None) -> int:
+                       color_meta: dict = None, width: int = 0, height: int = 0) -> int:
     """Streaming dual-pipe upscale: ffmpeg decode -> model -> ffmpeg encode.
 
     input_source can be a local file path or an HTTP(S) URL — ffmpeg handles both.
@@ -260,10 +260,8 @@ def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
     RGB->NV12 conversion done on GPU via BT.601/709 matrix (matching input) before CPU transfer.
     A ThreadPoolExecutor prefetches the next batch and overlaps pipe writes.
     """
-    # rgb24 pipe for quality model (ffmpeg's chroma subsampling is better than our box filter)
-    # NV12 pipe for fast model (halves bandwidth, quality doesn't matter for GAN)
-    use_nv12 = (model_key == "4fast")
-    model = _get_upscaler(model_key or scale_factor, gpu_id)
+    use_nv12 = (scale_factor == 4)
+    model = _get_upscaler(scale_factor, gpu_id)
     device = next(model.parameters()).device
     torch.cuda.empty_cache()
 
@@ -325,7 +323,7 @@ def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
 
             # RGB HWC uint8 -> RGB NCHW FP16, normalised to [0, 1]
             tensors = [
-                torch.from_numpy(f.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+                torch.from_numpy(f.astype(np.float32) / 255.0).permute(2, 0, 1)
                 for f in batch_frames
             ]
             batch = torch.stack(tensors).to(device).half()
@@ -398,7 +396,7 @@ def _nv12_to_rgb_bt601_bilinear(nv12: torch.Tensor, H: int, W: int) -> torch.Ten
     Y = nv12[:H].float() - 16.0
     uv = nv12[H:].view(H // 2, W // 2, 2).float()
     uv_up = torch.nn.functional.interpolate(
-        uv.permute(2, 0, 1).contiguous().unsqueeze(0), scale_factor=2,
+        uv.permute(2, 0, 1).unsqueeze(0), scale_factor=2,
         mode='bilinear', align_corners=False)
     U = uv_up[0, 0] - 128.0
     V = uv_up[0, 1] - 128.0
@@ -417,7 +415,7 @@ def _nv12_to_rgb_bt709_bilinear(nv12: torch.Tensor, H: int, W: int) -> torch.Ten
     Y = nv12[:H].float() - 16.0
     uv = nv12[H:].view(H // 2, W // 2, 2).float()
     uv_up = torch.nn.functional.interpolate(
-        uv.permute(2, 0, 1).contiguous().unsqueeze(0), scale_factor=2,
+        uv.permute(2, 0, 1).unsqueeze(0), scale_factor=2,
         mode='bilinear', align_corners=False)
     U = uv_up[0, 0] - 128.0
     V = uv_up[0, 1] - 128.0
@@ -466,96 +464,6 @@ def _rgb_to_nv12_bt709_gpu(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
     uv[:, 0::2] = Cb_s
     uv[:, 1::2] = Cr_s
     return torch.cat([Y_u8, uv], dim=0)
-
-
-
-def _upscale_nvvfx_streaming(input_source: str, output_path: Path,
-                              frame_rate: float, gpu_id: int = 0,
-                              color_meta: dict = None, width: int = 0, height: int = 0) -> int:
-    """nvidia-vfx x2 via ffmpeg URL decode (no download needed).
-
-    ffmpeg decode (rgb24) -> GPU -> nvvfx VSR -> NV12 -> ffmpeg encode.
-    Eliminates the download step that was causing 90s+ timeouts.
-    """
-    w, h = width, height
-    out_w, out_h = w * 2, h * 2
-
-    bt709 = _is_bt709(color_meta)
-    rgb_to_nv12 = _rgb_to_nv12_bt709_gpu if bt709 else _rgb_to_nv12_bt601_gpu
-    cs_label = "BT.709" if bt709 else "BT.601"
-    logger.info(f"nvvfx-stream: NV12 encode will use {cs_label} matrix")
-
-    vsr = _get_vsr(out_w, out_h, gpu_id)
-    torch.cuda.empty_cache()
-    device = torch.device(f"cuda:{gpu_id}")
-
-    frame_size = w * h * 3  # bytes per rgb24 input frame
-
-    decoder = subprocess.Popen(
-        ['ffmpeg', '-i', str(input_source),
-         '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
-
-    enc_cmd = [
-        'ffmpeg', '-y',
-        '-f', 'rawvideo', '-pix_fmt', 'nv12',
-        '-s', f'{out_w}x{out_h}', '-r', str(frame_rate),
-        '-i', 'pipe:0',
-        '-c:v', 'hevc_nvenc', '-cq', '20', '-preset', 'p4',
-        '-profile:v', 'main', '-pix_fmt', 'yuv420p',
-        '-sar', '1:1',
-        *_build_color_flags(color_meta or {}),
-        '-movflags', '+faststart',
-        str(output_path),
-    ]
-    encoder = subprocess.Popen(
-        enc_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-
-    total_frames = 0
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        pending_write = None
-        while True:
-            raw = decoder.stdout.read(frame_size)
-            if len(raw) < frame_size:
-                break
-
-            # rgb24 HWC uint8 -> float32 CHW [0,1] on GPU
-            frame_np = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, 3).copy()
-            rgb = (
-                torch.from_numpy(frame_np.astype(np.float32) / 255.0)
-                .permute(2, 0, 1).contiguous()
-                .to(device)
-            )
-
-            result = vsr.run(rgb)
-            out_gpu = torch.from_dlpack(result.image).clone()
-
-            out_bytes = (
-                rgb_to_nv12(out_gpu.clamp_(0, 1), out_h, out_w)
-                .contiguous().cpu().numpy().tobytes()
-            )
-            if pending_write is not None:
-                pending_write.result()
-            pending_write = pool.submit(encoder.stdin.write, out_bytes)
-
-            total_frames += 1
-            if total_frames % 50 == 0:
-                logger.info(f"  nvvfx-stream cuda:{gpu_id}: {total_frames} frames done")
-
-        if pending_write is not None:
-            pending_write.result()
-
-    encoder.stdin.close()
-    enc_stderr = encoder.stderr.read()
-    encoder.wait()
-    decoder.wait()
-
-    if encoder.returncode != 0:
-        raise RuntimeError(f"Encoder failed: {enc_stderr.decode()[:500]}")
-
-    return total_frames
 
 
 def _upscale_nvvfx(input_path: Path, output_path: Path,
@@ -704,24 +612,25 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
         Path("tmp").mkdir(exist_ok=True)
         cleanup_files = []  # local intermediates to delete
 
-        # Pass input directly to upscaler (no downscale — validator expects output = input × scale_factor)
-        upscale_source, upscale_w, upscale_h = input_source, w, h
+        # x4 path: downscale to 540p first (handles URLs — ffmpeg downloads+downscales)
+        if scale_factor == 4:
+            ds_source, ds_w, ds_h, ds_created = _downscale_to_540p(
+                input_source, frame_rate, w, h)
+            if ds_created:
+                cleanup_files.append(Path(ds_source))
+            upscale_source, upscale_w, upscale_h = ds_source, ds_w, ds_h
+        else:
+            upscale_source, upscale_w, upscale_h = input_source, w, h
 
         # x2 path: use nvidia-vfx if available (2-3x faster), else SPAN fallback
         if scale_factor == 2 and _GPU_DIRECT_AVAILABLE:
             try:
                 print(f"Step 2: Upscaling with nvidia-vfx x2 on cuda:0...")
                 start_time = time.time()
-                if is_url:
-                    total = _upscale_nvvfx_streaming(
-                        upscale_source, output_file_upscaled, frame_rate, gpu_id=0,
-                        color_meta=color_meta, width=upscale_w, height=upscale_h
-                    )
-                else:
-                    total = _upscale_nvvfx(
-                        Path(upscale_source), output_file_upscaled, frame_rate, gpu_id=0,
-                        color_meta=color_meta, width=upscale_w, height=upscale_h
-                    )
+                total = _upscale_nvvfx(
+                    Path(upscale_source), output_file_upscaled, frame_rate, gpu_id=0,
+                    color_meta=color_meta, width=upscale_w, height=upscale_h
+                )
                 print(f"All {total} frames upscaled and encoded (nvidia-vfx).")
                 elapsed_time = time.time() - start_time
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
@@ -738,16 +647,13 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
                 elapsed_time = time.time() - start_time
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
         else:
-            x4_key = ("4fast" if upscale_w * upscale_h > _X4_MAX_PIXELS else 4) if scale_factor == 4 else None
-            x4_label = "PLKSR" if (x4_key == 4) else ("realesr-x4v3" if x4_key == "4fast" else "SPAN")
-            print(f"Step 2: Upscaling with {x4_label} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
-            logger.info(f"x4 model selection: {upscale_w}x{upscale_h} = {upscale_w*upscale_h} pixels, model_key={x4_key}")
+            model_name = "EfRLFN" if scale_factor == 4 else "SPAN"
+            print(f"Step 2: Upscaling with {model_name} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
             start_time = time.time()
             total = _upscale_streaming(
                 upscale_source, output_file_upscaled,
                 scale_factor, frame_rate, gpu_id=0, batch_size=4,
-                color_meta=color_meta, width=upscale_w, height=upscale_h,
-                model_key=x4_key
+                color_meta=color_meta, width=upscale_w, height=upscale_h
             )
             print(f"All {total} frames upscaled and encoded.")
             elapsed_time = time.time() - start_time
@@ -790,9 +696,17 @@ async def video_upscaler(request: UpscaleRequest):
         scale_factor = 4 if task_type == "SD24K" else 2
         t_total = time.time()
 
-        # Both x4 and x2 now stream from URL directly (no download)
-        logger.info(f"⚡ {'x4' if scale_factor == 4 else 'x2'} path: passing URL directly to ffmpeg (no download)")
-        processed_video_path = upscale_video(payload_url, task_type, is_url=True)
+        if scale_factor == 4:
+            # x4: pass URL directly to ffmpeg — skip download entirely
+            logger.info("⚡ x4 path: passing URL directly to ffmpeg (no download)")
+            processed_video_path = upscale_video(payload_url, task_type, is_url=True)
+        else:
+            # x2: pynvc HW decoder needs a local file
+            logger.info("📻 Downloading video (x2, pynvc needs local file)...")
+            t_dl = time.time()
+            payload_video_path: str = await download_video(payload_url)
+            logger.info(f"Download took {time.time()-t_dl:.2f}s, Path: {payload_video_path}")
+            processed_video_path = upscale_video(payload_video_path, task_type, is_url=False)
 
         processed_video_name = Path(processed_video_path).name
         logger.info(f"Processed video path: {processed_video_path}, video name: {processed_video_name}")
