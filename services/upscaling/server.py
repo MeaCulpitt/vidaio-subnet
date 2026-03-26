@@ -260,7 +260,9 @@ def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
     RGB->NV12 conversion done on GPU via BT.601/709 matrix (matching input) before CPU transfer.
     A ThreadPoolExecutor prefetches the next batch and overlaps pipe writes.
     """
-    use_nv12 = (scale_factor == 4)
+    # rgb24 pipe for quality model (ffmpeg's chroma subsampling is better than our box filter)
+    # NV12 pipe for fast model (halves bandwidth, quality doesn't matter for GAN)
+    use_nv12 = (model_key == "4fast")
     model = _get_upscaler(model_key or scale_factor, gpu_id)
     device = next(model.parameters()).device
     torch.cuda.empty_cache()
