@@ -57,9 +57,9 @@ _MODEL_PATHS = {
     "4fast": Path.home() / ".cache" / "span" / "realesr-general-x4v3.pth",  # GAN — fast fallback for large inputs
 }
 _upscalers: dict = {}  # (scale, gpu_id) -> nn.Module
-# PLKSR x4: 66ms/f at 480x270, PieAPP=0.07 (BONUS). Handles up to ~1042x584 in budget.
+# PLKSR x4: ~21ms/f at 480x270 (compiled), PieAPP=0.07 (BONUS). Safe up to ~1050x667.
 # realesr-x4v3: 5ms/f at 480x270, PieAPP>2.0 (PENALTY). Fast fallback.
-_X4_MAX_PIXELS = 650_000  # ~1042x624 — PLKSR handles this in ~59s. Above: GAN fallback.
+_X4_MAX_PIXELS = 700_000  # ~1050x667 — compiled PLKSR handles in <48s Step 2
 
 # ---------------------------------------------------------------------------
 # nvidia-vfx VideoSuperRes cache (for GPU-direct x2 path)
@@ -82,9 +82,10 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     model = descriptor.model.eval().half()
     nparams = sum(p.numel() for p in model.parameters()) / 1e6
 
-    if scale == "4fast":
-        # Only compile the fast/small GAN model (torch.compile hurts RRDB performance)
-        logger.info(f"Compiling {model_name} x4fast with torch.compile(dynamic=True)...")
+    if scale in ("4fast", 4):
+        # torch.compile both PLKSR and realesr-x4v3 (dynamic=True for varying input sizes)
+        label = "x4fast" if scale == "4fast" else "x4"
+        logger.info(f"Compiling {model_name} {label} with torch.compile(dynamic=True)...")
         model = torch.compile(model, dynamic=True)
         dummy = torch.randn(1, 3, 270, 480, device=f"cuda:{gpu_id}", dtype=torch.float16)
         for _ in range(3):
@@ -92,7 +93,7 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
                 model(dummy)
         del dummy
         torch.cuda.empty_cache()
-        logger.info(f"{model_name} x4fast compiled on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
+        logger.info(f"{model_name} {label} compiled on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
     else:
         logger.info(f"{model_name} x{scale} loaded on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
 
