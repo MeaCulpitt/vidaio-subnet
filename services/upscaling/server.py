@@ -19,6 +19,7 @@ from services.miner_utilities.redis_utils import schedule_file_deletion
 from vidaio_subnet_core.utilities import storage_client, download_video
 from loguru import logger
 import traceback
+import uuid
 
 # ---------------------------------------------------------------------------
 # Optional GPU-direct imports (nvidia-vfx + PyNvVideoCodec)
@@ -187,6 +188,37 @@ def _get_color_metadata(video_path: Path) -> dict:
         return {'color_space': None, 'color_primaries': None, 'color_transfer': None}
 
 
+def _probe_video(source: str) -> dict:
+    """Single ffprobe call to get all video metadata. Works with files and URLs."""
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
+         '-show_entries', 'stream=width,height,r_frame_rate,color_space,color_primaries,color_transfer',
+         '-of', 'json', str(source)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    try:
+        info = json.loads(result.stdout)
+        stream = info.get("streams", [{}])[0]
+    except (json.JSONDecodeError, IndexError):
+        raise RuntimeError(f"ffprobe failed on {str(source)[:120]}: {result.stderr[:300]}")
+
+    rfr = stream.get('r_frame_rate', '30/1')
+    parts = rfr.split('/')
+    fps = float(parts[0]) / float(parts[1]) if len(parts) == 2 and float(parts[1]) != 0 else 30.0
+
+    meta = {
+        'width': int(stream.get('width', 0)),
+        'height': int(stream.get('height', 0)),
+        'fps': fps,
+        'color_space': stream.get('color_space'),
+        'color_primaries': stream.get('color_primaries'),
+        'color_transfer': stream.get('color_transfer'),
+    }
+    logger.info(f"Probed: {meta['width']}x{meta['height']} @ {meta['fps']:.1f}fps, "
+                f"color: {meta['color_space']}/{meta['color_primaries']}/{meta['color_transfer']}")
+    return meta
+
+
 def _build_color_flags(color_meta: dict) -> list:
     """Build ffmpeg encoder color metadata flags matching the input video.
 
@@ -216,11 +248,12 @@ def _is_bt709(color_meta: dict) -> bool:
     return cs in ('bt709', None, 'unknown')
 
 
-def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
+def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
                        frame_rate: float, gpu_id: int = 0, batch_size: int = 4,
-                       color_meta: dict = None) -> int:
+                       color_meta: dict = None, width: int = 0, height: int = 0) -> int:
     """Streaming dual-pipe upscale: ffmpeg decode -> model -> ffmpeg encode.
 
+    input_source can be a local file path or an HTTP(S) URL — ffmpeg handles both.
     Decoder outputs rgb24 rawvideo (input is small, ~1.5 MB/frame at 540p).
     For x4: encoder ingests NV12 (12.4 MB/frame vs 24.9 MB RGB24 -- 2x faster pipe).
     For x2: encoder ingests rgb24 (x2 uses nvidia-vfx path normally; this is fallback).
@@ -232,7 +265,7 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
     device = next(model.parameters()).device
     torch.cuda.empty_cache()
 
-    w, h = _get_video_dimensions(input_path)
+    w, h = width, height
     out_w, out_h = w * scale_factor, h * scale_factor
     frame_size = w * h * 3  # bytes per rgb24 input frame
 
@@ -244,7 +277,7 @@ def _upscale_streaming(input_path: Path, output_path: Path, scale_factor: int,
         logger.info(f"NV12 encode will use {cs_label} matrix")
 
     decoder = subprocess.Popen(
-        ['ffmpeg', '-i', str(input_path),
+        ['ffmpeg', '-i', str(input_source),
          '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
@@ -435,7 +468,7 @@ def _rgb_to_nv12_bt709_gpu(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
 
 def _upscale_nvvfx(input_path: Path, output_path: Path,
                    frame_rate: float, gpu_id: int = 0,
-                   color_meta: dict = None) -> int:
+                   color_meta: dict = None, width: int = 0, height: int = 0) -> int:
     """nvidia-vfx x2 upscale: pynvc NV12 HW decode -> nvidia-vfx -> ffmpeg encode.
 
     Decodes via PyNvVideoCodec hardware decoder (NV12, GPU memory) with
@@ -443,7 +476,7 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
     then nvidia-vfx VideoSuperRes (TensorRT-accelerated), then ffmpeg
     hevc_nvenc pipe encode with input-matching color metadata tags.
     """
-    w, h = _get_video_dimensions(input_path)
+    w, h = width, height
     out_w, out_h = w * 2, h * 2
 
     # Select BT.601 or BT.709 conversion based on input colorspace
@@ -515,22 +548,23 @@ def _upscale_nvvfx(input_path: Path, output_path: Path,
     return total_frames
 
 
-def _downscale_to_540p(input_path: Path, frame_rate: float) -> Path:
-    """Downscale video to 540p height (preserving aspect ratio) for x4 EfRLFN input.
+def _downscale_to_540p(input_source: str, frame_rate: float,
+                       width: int, height: int) -> tuple:
+    """Downscale video to 540p for x4 EfRLFN input. Accepts file path or URL.
 
-    EfRLFN x4 on 540p produces ~4K output. Without this, 1080p input would
-    produce 8K output that takes 172s+ and always times out.
+    Returns (output_source, new_w, new_h, created_local_file).
+    When input is already ≤540p, returns it unchanged.
+    When input is a URL, ffmpeg downloads+downscales in one pass.
     """
-    w, h = _get_video_dimensions(input_path)
-    if h <= 540:
-        logger.info(f"Input already ≤540p ({w}x{h}), skipping downscale")
-        return input_path
+    if height <= 540:
+        logger.info(f"Input already ≤540p ({width}x{height}), skipping downscale")
+        return input_source, width, height, False
 
-    logger.info(f"Pre-downscaling {w}x{h} → 540p for x4 EfRLFN (avoids 8K output)")
-    downscaled = input_path.with_name(f"{input_path.stem}_540p.mp4")
-    # scale to height=540, keep aspect ratio, ensure divisible by 2
+    logger.info(f"Pre-downscaling {width}x{height} → 540p for x4 EfRLFN (avoids 8K output)")
+    downscaled = Path("tmp") / f"{uuid.uuid4()}_540p.mp4"
+    Path("tmp").mkdir(exist_ok=True)
     cmd = [
-        'ffmpeg', '-y', '-i', str(input_path),
+        'ffmpeg', '-y', '-i', str(input_source),
         '-vf', 'scale=-2:540',
         '-c:v', 'hevc_nvenc', '-cq', '18', '-preset', 'p4',
         '-pix_fmt', 'yuv420p', '-r', str(frame_rate),
@@ -541,41 +575,52 @@ def _downscale_to_540p(input_path: Path, frame_rate: float) -> Path:
     if result.returncode != 0:
         raise RuntimeError(f"Downscale failed: {result.stderr.decode()[:500]}")
 
-    new_w, new_h = _get_video_dimensions(downscaled)
+    new_w, new_h = _get_video_dimensions(str(downscaled))
     logger.info(f"Downscaled to {new_w}x{new_h} → x4 output will be {new_w*4}x{new_h*4}")
-    return downscaled
+    return str(downscaled), new_w, new_h, True
 
 
-def upscale_video(payload_video_path: str, task_type: str):
+def upscale_video(input_source: str, task_type: str, is_url: bool = False):
+    """Upscale a video from a local file path or URL.
+
+    For x4 (SD24K): input_source can be a URL (ffmpeg reads directly, skips download).
+    For x2 (SD2HD): input_source must be a local file (pynvc HW decoder needs file).
+    """
     try:
-        input_file = Path(payload_video_path)
         scale_factor = 4 if task_type == "SD24K" else 2
 
-        if not input_file.exists() or not input_file.is_file():
-            raise HTTPException(status_code=400, detail="Input file does not exist or is not a valid file.")
+        if not is_url:
+            input_file = Path(input_source)
+            if not input_file.exists() or not input_file.is_file():
+                raise HTTPException(status_code=400, detail="Input file does not exist or is not a valid file.")
 
-        frame_rate = get_frame_rate(input_file)
+        # Single ffprobe call for all metadata (works on both files and URLs)
+        t_probe = time.time()
+        probe = _probe_video(input_source)
+        frame_rate = probe['fps']
+        w, h = probe['width'], probe['height']
+        color_meta = {
+            'color_space': probe['color_space'],
+            'color_primaries': probe['color_primaries'],
+            'color_transfer': probe['color_transfer'],
+        }
+        logger.info(f"Probe took {time.time()-t_probe:.2f}s")
         print(f"Frame rate detected: {frame_rate} fps")
 
-        # Probe input color metadata BEFORE any processing (downscale etc.)
-        # so we mirror the original source's color tags on our output.
-        color_meta = _get_color_metadata(input_file)
+        # Generate output path with UUID (works for both URL and file inputs)
+        output_file_upscaled = Path("tmp") / f"{uuid.uuid4()}_upscaled.mp4"
+        Path("tmp").mkdir(exist_ok=True)
+        cleanup_files = []  # local intermediates to delete
 
-        # x4 path: downscale to 540p first so EfRLFN x4 outputs ~4K, not 8K
+        # x4 path: downscale to 540p first (handles URLs — ffmpeg downloads+downscales)
         if scale_factor == 4:
-            original_input = input_file
-            input_file = _downscale_to_540p(input_file, frame_rate)
-            # Clean up downscaled intermediate if it's a new file
-            if input_file != original_input:
-                _cleanup_540p = original_input  # will delete original after upscaling
-            else:
-                _cleanup_540p = None
+            ds_source, ds_w, ds_h, ds_created = _downscale_to_540p(
+                input_source, frame_rate, w, h)
+            if ds_created:
+                cleanup_files.append(Path(ds_source))
+            upscale_source, upscale_w, upscale_h = ds_source, ds_w, ds_h
         else:
-            _cleanup_540p = None
-
-        output_file_upscaled = Path(payload_video_path).with_name(
-            f"{Path(payload_video_path).stem}_upscaled.mp4"
-        )
+            upscale_source, upscale_w, upscale_h = input_source, w, h
 
         # x2 path: use nvidia-vfx if available (2-3x faster), else SPAN fallback
         if scale_factor == 2 and _GPU_DIRECT_AVAILABLE:
@@ -583,8 +628,8 @@ def upscale_video(payload_video_path: str, task_type: str):
                 print(f"Step 2: Upscaling with nvidia-vfx x2 on cuda:0...")
                 start_time = time.time()
                 total = _upscale_nvvfx(
-                    input_file, output_file_upscaled, frame_rate, gpu_id=0,
-                    color_meta=color_meta
+                    Path(upscale_source), output_file_upscaled, frame_rate, gpu_id=0,
+                    color_meta=color_meta, width=upscale_w, height=upscale_h
                 )
                 print(f"All {total} frames upscaled and encoded (nvidia-vfx).")
                 elapsed_time = time.time() - start_time
@@ -594,22 +639,21 @@ def upscale_video(payload_video_path: str, task_type: str):
                 print(f"Step 2: Falling back to SPAN x{scale_factor} on cuda:0 (streaming dual-pipe)...")
                 start_time = time.time()
                 total = _upscale_streaming(
-                    input_file, output_file_upscaled,
+                    upscale_source, output_file_upscaled,
                     scale_factor, frame_rate, gpu_id=0, batch_size=4,
-                    color_meta=color_meta
+                    color_meta=color_meta, width=upscale_w, height=upscale_h
                 )
                 print(f"All {total} frames upscaled and encoded (SPAN fallback).")
                 elapsed_time = time.time() - start_time
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
         else:
-            # x4 path: uses EfRLFN (nvidia-vfx doesn't support x4 natively)
             model_name = "EfRLFN" if scale_factor == 4 else "SPAN"
             print(f"Step 2: Upscaling with {model_name} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
             start_time = time.time()
             total = _upscale_streaming(
-                input_file, output_file_upscaled,
+                upscale_source, output_file_upscaled,
                 scale_factor, frame_rate, gpu_id=0, batch_size=4,
-                color_meta=color_meta
+                color_meta=color_meta, width=upscale_w, height=upscale_h
             )
             print(f"All {total} frames upscaled and encoded.")
             elapsed_time = time.time() - start_time
@@ -618,17 +662,18 @@ def upscale_video(payload_video_path: str, task_type: str):
         if not output_file_upscaled.exists():
             raise HTTPException(status_code=500, detail="Upscaled MP4 video file was not created.")
 
-        # Clean up the 540p intermediate (if created) and the original input
-        if _cleanup_540p is not None:
-            if _cleanup_540p.exists():
-                _cleanup_540p.unlink()
-                print(f"Original file {_cleanup_540p} deleted.")
-            if input_file.exists():
-                input_file.unlink()
-                print(f"540p intermediate {input_file} deleted.")
-        elif input_file.exists():
-            input_file.unlink()
-            print(f"Original file {input_file} deleted.")
+        # Clean up intermediates
+        for f in cleanup_files:
+            if f.exists():
+                f.unlink()
+                print(f"Intermediate {f} deleted.")
+
+        # Clean up input file only if it's a local file (not a URL)
+        if not is_url:
+            p = Path(input_source)
+            if p.exists():
+                p.unlink()
+                print(f"Original file {p} deleted.")
 
         print(f"Returning from FastAPI: {output_file_upscaled}")
         return output_file_upscaled
@@ -648,20 +693,30 @@ async def video_upscaler(request: UpscaleRequest):
             logger.error(f"Invalid payload URL (missing protocol): {payload_url!r}")
             return {"uploaded_video_url": None}
 
-        logger.info("📻 Downloading video....")
-        payload_video_path: str = await download_video(payload_url)
-        logger.info(f"Download video finished, Path: {payload_video_path}")
+        scale_factor = 4 if task_type == "SD24K" else 2
+        t_total = time.time()
 
-        processed_video_path = upscale_video(payload_video_path, task_type)
+        if scale_factor == 4:
+            # x4: pass URL directly to ffmpeg — skip download entirely
+            logger.info("⚡ x4 path: passing URL directly to ffmpeg (no download)")
+            processed_video_path = upscale_video(payload_url, task_type, is_url=True)
+        else:
+            # x2: pynvc HW decoder needs a local file
+            logger.info("📻 Downloading video (x2, pynvc needs local file)...")
+            t_dl = time.time()
+            payload_video_path: str = await download_video(payload_url)
+            logger.info(f"Download took {time.time()-t_dl:.2f}s, Path: {payload_video_path}")
+            processed_video_path = upscale_video(payload_video_path, task_type, is_url=False)
+
         processed_video_name = Path(processed_video_path).name
-
         logger.info(f"Processed video path: {processed_video_path}, video name: {processed_video_name}")
 
         if processed_video_path is not None:
             object_name: str = processed_video_name
 
+            t_upload = time.time()
             await storage_client.upload_file(object_name, processed_video_path)
-            logger.info("Video uploaded successfully.")
+            logger.info(f"Upload took {time.time()-t_upload:.2f}s")
 
             if os.path.exists(processed_video_path):
                 os.remove(processed_video_path)
@@ -680,7 +735,7 @@ async def video_upscaler(request: UpscaleRequest):
             else:
                 logger.warning(f"Failed to schedule deletion of {object_name}")
 
-            logger.info(f"Public download link: {sharing_link}")
+            logger.info(f"Total e2e: {time.time()-t_total:.2f}s | link: {sharing_link}")
 
             return {"uploaded_video_url": sharing_link}
 

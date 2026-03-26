@@ -4,6 +4,7 @@ import os
 import asyncio
 import datetime
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError
 from botocore.client import Config
 from botocore.config import Config as BotoConfig
@@ -134,15 +135,24 @@ class AmazonS3Client:
                 s3={"addressing_style": "virtual"}  # avoid path-style pitfalls
             ),
         )
+        self.transfer_config = TransferConfig(
+            multipart_threshold=5 * 1024 * 1024,   # 5 MB
+            max_concurrency=10,
+            multipart_chunksize=5 * 1024 * 1024,   # 5 MB
+            use_threads=True,
+        )
         self.executor = ThreadPoolExecutor()
 
     async def upload_file(self, object_name, file_path):
-        func = self.client.upload_file
-        args = (file_path, self.bucket_name, object_name)
+        tc = self.transfer_config
+        def _do_upload():
+            self.client.upload_file(
+                file_path, self.bucket_name, object_name, Config=tc
+            )
         print("Attempting to upload")
         try:
             loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(self.executor, func, *args)
+            result = await loop.run_in_executor(self.executor, _do_upload)
             print(f"The bucket_name is {self.bucket_name} and the result was {result}")
             return {"etag": None, "version_id": None}
         except Exception as e:
