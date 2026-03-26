@@ -41,12 +41,12 @@ class UpscaleRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Model cache — SPAN x2 loaded via spandrel, EfRLFN x4 loaded directly
+# Model cache — all models loaded via spandrel
 # ---------------------------------------------------------------------------
-_SPAN_MODELS = {
+_MODEL_PATHS = {
     2: Path.home() / ".cache" / "span" / "2xHFA2kSPAN.safetensors",
+    4: Path.home() / ".cache" / "span" / "realesr-general-x4v3.pth",
 }
-_EFRLFN_X4_PATH = Path.home() / ".cache" / "span" / "EfRLFN_x4.pt"
 _upscalers: dict = {}  # (scale, gpu_id) -> nn.Module
 
 # ---------------------------------------------------------------------------
@@ -60,41 +60,32 @@ def _get_upscaler(scale: int, gpu_id: int) -> torch.nn.Module:
     if key in _upscalers:
         return _upscalers[key]
 
+    model_path = _MODEL_PATHS.get(scale)
+    if model_path is None or not model_path.exists():
+        raise RuntimeError(f"Model for x{scale} not found at {model_path}")
+
+    model_name = model_path.stem
+    logger.info(f"Loading {model_name} x{scale} from {model_path} on cuda:{gpu_id} (spandrel)...")
+    descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
+    model = descriptor.model.eval().half()
+    nparams = sum(p.numel() for p in model.parameters()) / 1e6
+
     if scale == 4:
-        # EfRLFN x4 — 0.5M params, VMAF 87.59 (vs SPAN 76.98)
-        from services.upscaling.efrlfn_arch.model import EfRLFN
-        if not _EFRLFN_X4_PATH.exists():
-            raise RuntimeError(f"EfRLFN x4 model not found at {_EFRLFN_X4_PATH}")
-        logger.info(f"Loading EfRLFN x4 from {_EFRLFN_X4_PATH} on cuda:{gpu_id}...")
-        model = EfRLFN(upscale=4)
-        state = torch.load(str(_EFRLFN_X4_PATH), map_location='cpu', weights_only=True)
-        model.load_state_dict(state, strict=True)
-        model = model.to(f"cuda:{gpu_id}").eval().half()
-        # torch.compile with dynamic shapes — avoids recompile for varying
-        # validator input resolutions (540p, 480p, etc.)
-        logger.info(f"Compiling EfRLFN x4 with torch.compile(dynamic=True)...")
+        # torch.compile for x4 — dynamic shapes for varying validator resolutions
+        logger.info(f"Compiling {model_name} x4 with torch.compile(dynamic=True)...")
         model = torch.compile(model, dynamic=True)
-        # Warmup: trigger compilation for typical 540p input
         dummy = torch.randn(1, 3, 540, 960, device=f"cuda:{gpu_id}", dtype=torch.float16)
         for _ in range(3):
             with torch.no_grad():
                 model(dummy)
         del dummy
         torch.cuda.empty_cache()
-        _upscalers[key] = model
-        logger.info(f"EfRLFN x4 compiled and warmed up on cuda:{gpu_id} (0.50M params, fp16)")
-        return model
+        logger.info(f"{model_name} x4 compiled on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
     else:
-        # SPAN x2 via spandrel
-        model_path = _SPAN_MODELS[scale]
-        if not model_path.exists():
-            raise RuntimeError(f"SPAN x{scale} model not found at {model_path}")
-        logger.info(f"Loading SPAN x{scale} model from {model_path} on cuda:{gpu_id}...")
-        descriptor = ModelLoader(device=f"cuda:{gpu_id}").load_from_file(str(model_path))
-        model = descriptor.model.eval().half()
-        _upscalers[key] = model
-        logger.info(f"SPAN x{scale} loaded on cuda:{gpu_id}")
-        return model
+        logger.info(f"{model_name} x{scale} loaded on cuda:{gpu_id} ({nparams:.2f}M params, fp16)")
+
+    _upscalers[key] = model
+    return model
 
 
 def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
@@ -117,8 +108,8 @@ def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
 
 @app.on_event("startup")
 async def preload_models():
-    # Always load EfRLFN x4 (GPU-direct only handles x2)
-    logger.info("Pre-loading EfRLFN x4 on cuda:0...")
+    # Always load x4 model
+    logger.info("Pre-loading x4 model on cuda:0...")
     _get_upscaler(4, 0)
     if _GPU_DIRECT_AVAILABLE:
         logger.info("Pre-loading nvidia-vfx VSR for x2 (1080p→4K) on cuda:0...")
@@ -241,11 +232,13 @@ def _build_color_flags(color_meta: dict) -> list:
 def _is_bt709(color_meta: dict) -> bool:
     """Determine if the input video uses BT.709 colorspace.
 
-    Returns True for BT.709 or when colorspace is absent/unknown
-    (HD content defaults to BT.709 in practice).
+    Returns True only for explicitly BT.709-tagged content.
+    Defaults to BT.601 for absent/unknown tags -- this matches ffmpeg's
+    default yuv<->rgb matrix for untagged content and avoids the colour
+    shift that caused PieAPP=10+ vs PieAPP=3 with correct BT.601.
     """
     cs = (color_meta or {}).get('color_space')
-    return cs in ('bt709', None, 'unknown')
+    return cs == 'bt709'  # None / unknown / absent -> BT.601
 
 
 def _upscale_streaming(input_source: str, output_path: Path, scale_factor: int,
@@ -647,7 +640,7 @@ def upscale_video(input_source: str, task_type: str, is_url: bool = False):
                 elapsed_time = time.time() - start_time
                 print(f"Step 2 completed in {elapsed_time:.2f} seconds. Upscaled MP4 file: {output_file_upscaled}")
         else:
-            model_name = "EfRLFN" if scale_factor == 4 else "SPAN"
+            model_name = "RealESR" if scale_factor == 4 else "SPAN"
             print(f"Step 2: Upscaling with {model_name} x{scale_factor} on cuda:0 (streaming dual-pipe)...")
             start_time = time.time()
             total = _upscale_streaming(
