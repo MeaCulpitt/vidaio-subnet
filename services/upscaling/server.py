@@ -131,8 +131,10 @@ def _get_vsr(out_w: int, out_h: int, gpu_id: int = 0):
         vsr = _vsr_cache[key]
         if vsr.output_width == out_w and vsr.output_height == out_h:
             return vsr
+    # HIGHBITRATE_ULTRA: PieAPP=0.113 S_F=0.301 (vs HIGH: PieAPP=0.249 S_F=0.203)
+    # Same speed (~186 FPS). Designed for clean/lossless sources — skips artifact suppression.
     vsr = nvvfx.VideoSuperRes(
-        quality=nvvfx.VideoSuperRes.QualityLevel.HIGH, device=gpu_id
+        quality=nvvfx.VideoSuperRes.QualityLevel.HIGHBITRATE_ULTRA, device=gpu_id
     )
     vsr.output_width = out_w
     vsr.output_height = out_h
