@@ -4,9 +4,10 @@
 ENCODER_SETTINGS = {
     
     "libsvtav1": {  # Changed from "AV1_Optimized"
-        # CRF 52 + preset 8: 20x compression on 16Mbps input, 12s encode time.
-        # av1_nvenc CRF 30 INFLATED files (C>0.80 = score zero).
-        "codec": "libsvtav1", "preset": "8", "crf": 52, "keyint": 50,
+        # Preset 10 + CRF 52: fast enough for 30s clips within 135s timeout.
+        # Preset 8 was timing out on longer content (173s for 30s clip).
+        # Preset 10: 6.6s/10s vs preset 8: 12s/10s — 1.8x faster, slight quality loss.
+        "codec": "libsvtav1", "preset": "10", "crf": 52, "keyint": 50,
     },
     "av1_nvenc": {
         "codec": "av1_nvenc", "preset": "p6", "cq": 30, "keyint": 50, 'pix_fmt': 'yuv420p'
@@ -100,12 +101,14 @@ SCENE_SPECIFIC_PARAMS = {
         'unclear': {'deadline': 'good', 'cpu-used': 2, 'aq-mode': 1, 'keyint': 100},
     },
     'libsvtav1': {
-        'Screen Content / Text': {'preset': '6', 'tune': 0, 'keyint': 250},  # tune 0 = subjective quality
-        'Faces / People': {'preset': '8', 'tune': 1, 'keyint': 100},        # tune 1 = objective quality
-        'Animation / Cartoon / Rendered Graphics': {'preset': '7', 'tune': 0, 'keyint': 150},
-        'Gaming Content': {'preset': '9', 'tune': 2, 'keyint': 75},         # tune 2 = fast decode
-        'other': {'preset': '8', 'tune': 1, 'keyint': 100},
-        'unclear': {'preset': '8', 'tune': 1, 'keyint': 100},
+        # All presets bumped to 10+ to stay within 135s timeout on 30s clips.
+        # Preset 8 was timing out (173s for 30s). Preset 10: ~7s/10s.
+        'Screen Content / Text': {'preset': '10', 'tune': 0, 'keyint': 250},
+        'Faces / People': {'preset': '10', 'tune': 1, 'keyint': 100},
+        'Animation / Cartoon / Rendered Graphics': {'preset': '10', 'tune': 0, 'keyint': 150},
+        'Gaming Content': {'preset': '11', 'tune': 2, 'keyint': 75},
+        'other': {'preset': '10', 'tune': 1, 'keyint': 100},
+        'unclear': {'preset': '10', 'tune': 1, 'keyint': 100},
     },
     'libvvenc': {
         'Screen Content / Text': {'preset': 'slow', 'keyint': 250},
