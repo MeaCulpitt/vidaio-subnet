@@ -4,8 +4,9 @@
 ENCODER_SETTINGS = {
     
     "libsvtav1": {  # Changed from "AV1_Optimized"
-        "codec": "libsvtav1", "preset": "8", "crf": 30, "keyint": 50,
-        # SVT-AV1 specific settings
+        # CRF 52 + preset 8: 20x compression on 16Mbps input, 12s encode time.
+        # av1_nvenc CRF 30 INFLATED files (C>0.80 = score zero).
+        "codec": "libsvtav1", "preset": "8", "crf": 52, "keyint": 50,
     },
     "av1_nvenc": {
         "codec": "av1_nvenc", "preset": "p6", "cq": 30, "keyint": 50, 'pix_fmt': 'yuv420p'
@@ -196,11 +197,13 @@ QUALITY_MAPPING_ANCHORS = {
         "model_ref_cq_range": [10, 63],
         "target_param_type": "crf",
         "target_param_range": [0, 63], # SVT-AV1 CRF range
+        # libsvtav1 is MUCH more efficient than av1_nvenc — needs higher CRF
+        # for equivalent compression. Old 1:1 mapping caused file inflation.
         "anchor_points": [ # [model_av1_nvenc_cq, svt_av1_crf]
-            [20, 21], # SVT-AV1 slightly different from NVENC
-            [30, 31],
-            [40, 41],
-            [50, 51]
+            [20, 42], # av1_nvenc CQ 20 → svt CRF 42 (good quality, decent compression)
+            [25, 48], # av1_nvenc CQ 25 → svt CRF 48 (10x compression)
+            [30, 52], # av1_nvenc CQ 30 → svt CRF 52 (20x compression, competitive)
+            [40, 55], # av1_nvenc CQ 40 → svt CRF 55 (aggressive compression)
         ]
     },
     "libvvenc": { # Mapping av1_nvenc CQ to libvvenc CRF
@@ -231,9 +234,11 @@ CODEC_CQ_LIMITS = {
         'description': 'NVIDIA AV1 encoder'
     },
     'libsvtav1': {  #   Standardized name
-        'max_cq': 50,
-        'recommended_max': 45,
-        'quality_range': (25, 45),
+        # Aggressive CRF needed for competitive compression scores.
+        # CRF 48-55 achieves 10-30x compression matching top miners.
+        'max_cq': 60,
+        'recommended_max': 55,
+        'quality_range': (45, 58),
         'description': 'SVT-AV1 encoder'
     },
     

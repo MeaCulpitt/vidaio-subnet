@@ -158,7 +158,10 @@ def map_codec_name(target_codec: str, prefer_gpu: bool = True) -> str:
         map_codec_name('h264', prefer_gpu=False) → 'libx264'
     """
     codec_map = {
-        'av1': 'av1_nvenc' if prefer_gpu else 'libsvtav1',
+        # Force libsvtav1 for AV1: av1_nvenc produces LARGER files on already-compressed
+        # input (C>0.80 = zero score). libsvtav1 achieves 20x compression (C=0.05)
+        # matching top miners, with 12s encode time (well within 135s timeout).
+        'av1': 'libsvtav1',
         'hevc': 'hevc_nvenc' if prefer_gpu else 'libx265',
         'h264': 'h264_nvenc' if prefer_gpu else 'libx264',
         'vp9': 'libvpx_vp9',  # No NVENC encoder for VP9
